@@ -17,6 +17,7 @@ import requests
 import json
 import re
 import smtplib
+import os
 from email.mime.text import MIMEText
 from datetime import datetime
 from bs4 import BeautifulSoup
@@ -52,9 +53,9 @@ SEARCH_PAGES = [
 ]
 
 # ---------------- EMAIL ----------------
-EMAIL_SENDER = "your_email@gmail.com"
-EMAIL_PASSWORD = "your_app_password"
-EMAIL_RECEIVER = "your_email@gmail.com"
+EMAIL_SENDER = os.getenv("EMAIL_SENDER")
+EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD")
+EMAIL_RECEIVER = os.getenv("EMAIL_RECEIVER")
 
 # ---------------- STORAGE ----------------
 
