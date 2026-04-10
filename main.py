@@ -5,10 +5,10 @@ import aiohttp
 import logging
 import re
 from collections import defaultdict
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urljoin
 
 # =========================
-# LOGGING (IMPORTANT FIX)
+# LOGGING
 # =========================
 
 logging.basicConfig(
@@ -22,115 +22,46 @@ logging.basicConfig(
 
 COMPANIES_FILE = "companies.json"
 
-INCLUDE_TITLE_KEYWORDS = [
-    "software engineer",
-    "software developer",
-    "backend engineer",
-    "backend developer",
-    "engineer",
-    "developer"
+INCLUDE_TITLE = ["engineer", "developer"]
+MUST_HAVE_SENIOR = ["senior", "sr"]
+
+EXCLUDE = [
+    "staff", "principal", "vp", "director",
+    "head", "lead", "manager", "architect",
+    "intern", "junior"
 ]
 
-STRICT_EXCLUDE_KEYWORDS = [
-    "staff",
-    "principal",
-    "vp",
-    "vice president",
-    "director",
-    "lead",
-    "manager",
-    "head",
-    "architect",
-    "junior",
-    "intern"
-]
+CANADA_KEYWORDS = ["canada", "remote", "ca"]
 
-CANADA_KEYWORDS = [
-    "canada",
-    "remote canada",
-    "vancouver",
-    "ca"
-]
+CACHE = set()
 
 # =========================
-# COMPANY STORAGE
+# FILE
 # =========================
 
 def load_companies():
     if not os.path.exists(COMPANIES_FILE):
         return []
-    with open(COMPANIES_FILE, "r") as f:
-        return json.load(f)
+    return json.load(open(COMPANIES_FILE))
 
-def save_companies(companies):
-    with open(COMPANIES_FILE, "w") as f:
-        json.dump(companies, f, indent=2)
+def save_companies(c):
+    json.dump(c, open(COMPANIES_FILE, "w"), indent=2)
 
 # =========================
-# DEBUG HELPERS
+# SALARY (FIXED PROPERLY)
 # =========================
 
-def debug_job(reason, job):
-    logging.info(f"[FILTER-{reason}] {job.get('title')} | {job.get('url')}")
-
-# =========================
-# COMPANY DETECTION
-# =========================
-
-def detect_company_from_url(url: str):
-    try:
-        domain = urlparse(url).netloc.lower()
-        path = urlparse(url).path.strip("/").split("/")
-
-        if "greenhouse.io" in domain and path:
-            return {"platform": "greenhouse", "slug": path[0]}
-
-        if "lever.co" in domain and path:
-            return {"platform": "lever", "slug": path[0]}
-
-        if "ashbyhq.com" in domain and path:
-            return {"platform": "ashby", "slug": path[0]}
-
-        if "workable.com" in domain and path:
-            return {"platform": "workable", "slug": path[0]}
-
-    except:
+def extract_salary(text):
+    if not text:
         return None
 
-    return None
-
-def update_companies(companies, jobs):
-    seen = set((c["platform"], c["slug"]) for c in companies)
-
-    for job in jobs:
-        detected = detect_company_from_url(job["url"])
-        if not detected:
-            continue
-
-        key = (detected["platform"], detected["slug"])
-
-        if key not in seen:
-            logging.info(f"[NEW COMPANY DISCOVERED] {detected}")
-            companies.append(detected)
-            seen.add(key)
-
-    return companies
-
-# =========================
-# SALARY EXTRACTION (FIXED)
-# =========================
-
-def extract_salary(text: str):
-    if not text:
-        return "Not specified"
-
-    t = text.replace(",", "")
+    # normalize unicode dashes
+    t = text.replace("—", "-").replace("–", "-").replace(",", "")
 
     patterns = [
-        r"\$\d{2,3},?\d{0,3}\s?[—-]\s?\$\d{2,3},?\d{0,3}",  # Coinbase style
-        r"\$\d{2,3}k\s?[—-]\s?\$\d{2,3}k",
-        r"\$\d{2,6}\s?[—-]\s?\$\d{2,6}",
-        r"\$\d{2,6}"
+        r"\$\d{5,6}\s*-\s*\$\d{5,6}",
+        r"\$\d{2,3}k\s*-\s*\$\d{2,3}k",
+        r"\$\d{5,6}",
     ]
 
     for p in patterns:
@@ -138,30 +69,84 @@ def extract_salary(text: str):
         if m:
             return m.group(0)
 
-    if "competitive" in t.lower():
-        return "Competitive"
+    return None
 
-    return "Not specified"
+async def fetch_salary_from_page(session, url):
+    try:
+        async with session.get(url, timeout=20) as r:
+            html = await r.text()
+            return extract_salary(html)
+    except:
+        return None
 
 # =========================
-# FILTERING (STRICT FIX)
+# FILTERING
 # =========================
 
-def is_senior_engineer(title: str):
+def is_valid(title, text):
     t = title.lower()
 
-    if any(x in t for x in STRICT_EXCLUDE_KEYWORDS):
-        return False
+    if not any(k in t for k in INCLUDE_TITLE):
+        return False, "NOT_ENGINEER"
 
-    return any(x in t for x in INCLUDE_TITLE_KEYWORDS)
+    if not any(k in t for k in MUST_HAVE_SENIOR):
+        return False, "NOT_SENIOR"
 
-def is_canada_friendly(text: str):
-    if not text:
-        return True
+    if any(k in t for k in EXCLUDE):
+        return False, "EXCLUDED_ROLE"
 
-    t = text.lower()
+    full = (title + " " + text).lower()
 
-    return any(k in t for k in CANADA_KEYWORDS) or "remote" in t
+    if not any(k in full for k in CANADA_KEYWORDS):
+        return False, "NOT_CANADA"
+
+    return True, "OK"
+
+def log_result(status, job):
+    logging.info(f"[{status}] {job['title']} | {job['url']}")
+
+# =========================
+# COMPANY DETECTION
+# =========================
+
+def detect_company(url):
+    try:
+        domain = urlparse(url).netloc
+        path = urlparse(url).path.strip("/").split("/")
+
+        if "greenhouse" in domain:
+            return {"platform": "greenhouse", "slug": path[0]}
+
+        if "lever" in domain:
+            return {"platform": "lever", "slug": path[0]}
+
+        if "ashby" in domain:
+            return {"platform": "ashby", "slug": path[0]}
+
+        if "workable" in domain:
+            return {"platform": "workable", "slug": path[0]}
+
+    except:
+        pass
+
+    return None
+
+def update_companies(existing, jobs):
+    seen = set((c["platform"], c["slug"]) for c in existing)
+
+    for j in jobs:
+        c = detect_company(j["url"])
+        if not c:
+            continue
+
+        key = (c["platform"], c["slug"])
+
+        if key not in seen:
+            logging.info(f"[NEW COMPANY] {c}")
+            existing.append(c)
+            seen.add(key)
+
+    return existing
 
 # =========================
 # GREENHOUSE
@@ -172,14 +157,12 @@ async def fetch_greenhouse(session, slug):
     logging.info(f"[GREENHOUSE] {slug}")
 
     try:
-        async with session.get(url, timeout=25) as r:
+        async with session.get(url) as r:
             if r.status != 200:
-                logging.warning(f"[GREENHOUSE {slug}] HTTP {r.status}")
+                logging.warning(f"[GH {slug}] {r.status}")
                 return []
             data = await r.json()
-
-    except Exception as e:
-        logging.error(f"[GREENHOUSE ERROR {slug}] {e}")
+    except:
         return []
 
     jobs = []
@@ -187,31 +170,29 @@ async def fetch_greenhouse(session, slug):
     for j in data.get("jobs", []):
         title = j.get("title", "")
         desc = j.get("content", "")
-        url = j.get("absolute_url")
+        link = j.get("absolute_url")
 
         job = {
             "company": slug,
             "title": title,
-            "url": url,
+            "url": link,
             "salary": extract_salary(desc),
-            "source": "greenhouse"
         }
 
-        # DEBUG ALWAYS (key fix)
-        logging.info(f"[CHECK GREENHOUSE] {title} | {url}")
+        valid, reason = is_valid(title, desc)
 
-        if not is_senior_engineer(title):
-            debug_job("REJECT_TITLE", job)
+        if not valid:
+            log_result(f"REJECT-{reason}", job)
             continue
 
-        if not is_canada_friendly(title + " " + desc):
-            debug_job("REJECT_LOCATION", job)
-            continue
+        if not job["salary"]:
+            job["salary"] = await fetch_salary_from_page(session, link)
 
-        debug_job("ACCEPTED", job)
+        job["salary"] = job["salary"] or "Not specified"
+
+        log_result("ACCEPT", job)
         jobs.append(job)
 
-    logging.info(f"[GREENHOUSE {slug}] -> {len(jobs)}")
     return jobs
 
 # =========================
@@ -223,13 +204,9 @@ async def fetch_lever(session, slug):
     logging.info(f"[LEVER] {slug}")
 
     try:
-        async with session.get(url, timeout=25) as r:
-            if r.status != 200:
-                return []
+        async with session.get(url) as r:
             data = await r.json()
-
-    except Exception as e:
-        logging.error(f"[LEVER ERROR {slug}] {e}")
+    except:
         return []
 
     jobs = []
@@ -237,78 +214,93 @@ async def fetch_lever(session, slug):
     for j in data:
         title = j.get("text", "")
         desc = j.get("description", "")
-        url = j.get("hostedUrl")
+        link = j.get("hostedUrl")
 
         job = {
             "company": slug,
             "title": title,
-            "url": url,
+            "url": link,
             "salary": extract_salary(desc),
-            "source": "lever"
         }
 
-        logging.info(f"[CHECK LEVER] {title} | {url}")
+        valid, reason = is_valid(title, desc)
 
-        if not is_senior_engineer(title):
-            debug_job("REJECT_TITLE", job)
+        if not valid:
+            log_result(f"REJECT-{reason}", job)
             continue
 
-        debug_job("ACCEPTED", job)
+        if not job["salary"]:
+            job["salary"] = await fetch_salary_from_page(session, link)
+
+        job["salary"] = job["salary"] or "Not specified"
+
+        log_result("ACCEPT", job)
         jobs.append(job)
 
-    logging.info(f"[LEVER {slug}] -> {len(jobs)}")
     return jobs
 
 # =========================
-# HIMALAYAS (SAFE SCRAPE)
+# HIMALAYAS (CANADA FIX)
 # =========================
 
 async def fetch_himalayas(session):
-    url = "https://himalayas.app/jobs?search=software%20engineer"
-    logging.info("[HIMALAYAS] scraping")
-
-    try:
-        async with session.get(url, timeout=25) as r:
-            html = await r.text()
-    except Exception as e:
-        logging.error(f"[HIMALAYAS ERROR] {e}")
-        return []
-
-    matches = re.findall(r'href="(/jobs/[^"]+)"', html)
+    base = "https://himalayas.app/jobs/countries/canada?q=ruby"
+    logging.info("[HIMALAYAS] start")
 
     jobs = []
-    seen = set()
 
-    for m in matches:
-        if m in seen:
+    for page in range(1, 4):  # paginate
+        url = base + f"&page={page}"
+        logging.info(f"[HIMALAYAS] page {page}")
+
+        try:
+            async with session.get(url) as r:
+                html = await r.text()
+        except:
             continue
-        seen.add(m)
 
-        job = {
-            "company": "himalayas",
-            "title": "Himalayas Job",
-            "url": "https://himalayas.app" + m,
-            "salary": "Not specified",
-            "source": "himalayas"
-        }
+        matches = re.findall(
+            r'<a[^>]+href="(/companies/[^"]+/jobs/[^"]+)"[^>]*>(.*?)</a>',
+            html,
+            re.DOTALL
+        )
 
-        logging.info(f"[CHECK HIMALAYAS] {job['url']}")
-        jobs.append(job)
+        for link, raw_title in matches:
+            title = re.sub("<.*?>", "", raw_title).strip()
+            full_url = urljoin("https://himalayas.app", link)
 
-    logging.info(f"[HIMALAYAS] -> {len(jobs)}")
+            if full_url in CACHE:
+                continue
+            CACHE.add(full_url)
+
+            job = {
+                "company": "himalayas",
+                "title": title,
+                "url": full_url,
+                "salary": "Not specified"
+            }
+
+            valid, reason = is_valid(title, "")
+
+            if not valid:
+                log_result(f"REJECT-{reason}", job)
+                continue
+
+            log_result("ACCEPT", job)
+            jobs.append(job)
+
+    logging.info(f"[HIMALAYAS] total {len(jobs)}")
     return jobs
 
 # =========================
-# GROUP EMAIL
+# EMAIL
 # =========================
 
 def group_jobs(jobs):
-    grouped = defaultdict(list)
-
+    g = defaultdict(list)
     for j in jobs:
-        grouped[j["company"]].append(j)
-
-    return grouped
+        g[j["company"]].append(j)
+    return g
 
 def format_email(grouped):
     out = []
@@ -325,10 +317,6 @@ def format_email(grouped):
 
     return "\n".join(out)
 
-# =========================
-# EMAIL
-# =========================
-
 def send_email(body, count):
     import smtplib
     from email.mime.text import MIMEText
@@ -338,31 +326,26 @@ def send_email(body, count):
     receiver = os.getenv("EMAIL_RECEIVER")
 
     msg = MIMEText(body)
-    msg["Subject"] = f"Senior Engineer Jobs - {count}"
+    msg["Subject"] = f"Senior Ruby Jobs ({count})"
     msg["From"] = sender
     msg["To"] = receiver
 
-    try:
-        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as s:
-            s.login(sender, password)
-            s.sendmail(sender, receiver, msg.as_string())
+    with smtplib.SMTP_SSL("smtp.gmail.com", 465) as s:
+        s.login(sender, password)
+        s.sendmail(sender, receiver, msg.as_string())
 
-        logging.info(f"[EMAIL] Sent {count} jobs")
-
-    except Exception as e:
-        logging.error(f"[EMAIL ERROR] {e}")
+    logging.info(f"[EMAIL] Sent {count}")
 
 # =========================
 # MAIN
 # =========================
 
 async def main():
-    logging.info("[SYSTEM] Starting Job Engine")
+    logging.info("[SYSTEM] Starting")
 
     companies = load_companies()
 
     async with aiohttp.ClientSession() as session:
-
         tasks = []
 
         for c in companies:
@@ -375,17 +358,17 @@ async def main():
 
         results = await asyncio.gather(*tasks)
 
-    all_jobs = [j for sub in results for j in sub]
+    jobs = [j for sub in results for j in sub]
 
-    logging.info(f"[DONE] Total jobs: {len(all_jobs)}")
+    logging.info(f"[DONE] {len(jobs)} jobs")
 
-    companies = update_companies(companies, all_jobs)
+    companies = update_companies(companies, jobs)
     save_companies(companies)
 
-    grouped = group_jobs(all_jobs)
+    grouped = group_jobs(jobs)
     email = format_email(grouped)
 
-    send_email(email, len(all_jobs))
+    send_email(email, len(jobs))
 
 if __name__ == "__main__":
     asyncio.run(main())
