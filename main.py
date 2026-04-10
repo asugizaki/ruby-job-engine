@@ -13,7 +13,6 @@ from email.mime.text import MIMEText
 from datetime import datetime
 from bs4 import BeautifulSoup
 import feedparser
-from playwright.async_api import async_playwright
 
 # ---------------- LOGGING ----------------
 logging.basicConfig(
@@ -22,8 +21,11 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-def log(step, msg):
-    logger.info(f"[{step}] {msg}")
+def log(step, msg, data=None):
+    if data is not None:
+        logger.info(f"[{step}] {msg} | {data}")
+    else:
+        logger.info(f"[{step}] {msg}")
 
 # ---------------- CONFIG ----------------
 RUBY_KEYWORDS = ["ruby", "rails"]
@@ -60,45 +62,88 @@ def load_companies():
     try:
         with open(COMPANY_STORE_FILE, "r") as f:
             data = json.load(f)
-            log("STATE", f"Loaded companies: {sum(len(v) for v in data.values())}")
+
+            log("STATE", "Loaded companies", {k: len(v) for k, v in data.items()})
             return data
-    except:
-        log("STATE", "No existing company file, creating new")
+
+    except Exception as e:
+        log("STATE", f"No existing file, creating new: {e}")
         return {"greenhouse": [], "lever": [], "ashby": []}
 
 
 def save_companies(data):
+    log("STATE", "Saving companies", {k: len(v) for k, v in data.items()})
+
     with open(COMPANY_STORE_FILE, "w") as f:
         json.dump(data, f, indent=2)
-    log("STATE", f"Saved companies: {sum(len(v) for v in data.values())}")
 
+
+# ---------------- PLATFORM DETECTION ----------------
 
 def detect_platform(url):
-    if "greenhouse" in url:
+    u = url.lower()
+
+    if "greenhouse.io" in u:
         return "greenhouse"
-    if "lever" in url:
+    if "lever.co" in u:
         return "lever"
-    if "ashby" in url:
+    if "ashbyhq.com" in u or "ashby" in u:
         return "ashby"
+
     return None
 
+
+# ---------------- COMPANY EXTRACTION (FIXED) ----------------
+
+def extract_company_from_url(url):
+    try:
+        url = url.split("?")[0].rstrip("/")
+        parts = url.split("/")
+
+        # GREENHOUSE
+        # boards.greenhouse.io/company/jobs/123
+        if "greenhouse" in url and "boards.greenhouse.io" in url:
+            idx = parts.index("boards.greenhouse.io")
+            return parts[idx + 1]
+
+        # LEVER
+        # jobs.lever.co/company/job-slug
+        if "lever.co" in url:
+            idx = parts.index("jobs.lever.co")
+            return parts[idx + 1]
+
+        # ASHBY
+        # jobs.ashbyhq.com/company/job-slug
+        if "ashby" in url:
+            idx = [i for i, p in enumerate(parts) if "ashby" in p][0]
+            return parts[idx + 1]
+
+        return None
+
+    except Exception as e:
+        log("DISCOVERY", f"Company parse failed: {url}", str(e))
+        return None
+
+
+# ---------------- DISCOVERY ----------------
 
 def discover_company(url, store):
     platform = detect_platform(url)
     if not platform:
         return
 
-    parts = url.split("/")
-    if len(parts) < 2:
-        return
+    company = extract_company_from_url(url)
 
-    company = parts[-1].strip()
     if not company:
         return
 
     if company not in store[platform]:
         store[platform].append(company)
-        log("DISCOVERY", f"New company: {company} ({platform})")
+        log("DISCOVERY", "NEW COMPANY FOUND", {
+            "company": company,
+            "platform": platform
+        })
+
 
 # ---------------- HELPERS ----------------
 
@@ -111,6 +156,7 @@ def is_excluded(text):
 def is_remote(text):
     return "remote" in text.lower()
 
+
 # ---------------- ASYNC HTTP ----------------
 
 async def fetch(session, url):
@@ -121,6 +167,7 @@ async def fetch(session, url):
     except Exception as e:
         log("HTTP", f"Failed {url}: {e}")
         return None
+
 
 # ---------------- RSS ----------------
 
@@ -142,14 +189,16 @@ def fetch_rss_jobs():
                         "company": "rss"
                     })
 
-            log("RSS", f"Parsed {feed} -> {len(data.entries)} entries")
+            log("RSS", f"{feed} -> {len(data.entries)} entries")
+
         except Exception as e:
             log("RSS", f"Error {feed}: {e}")
 
     log("RSS", f"Total RSS jobs: {len(jobs)}")
     return jobs
 
-# ---------------- PARSER ----------------
+
+# ---------------- JOB PARSER ----------------
 
 def extract_job_details(html, url):
     soup = BeautifulSoup(html, "html.parser")
@@ -157,18 +206,17 @@ def extract_job_details(html, url):
     title = None
     company = None
 
-    # Try common patterns
     if soup.find("h1"):
         title = soup.find("h1").get_text(strip=True)
 
     if soup.find("h2"):
         company = soup.find("h2").get_text(strip=True)
 
-    # fallback
     if not company:
         company = urlparse(url).netloc
 
     return title, company
+
 
 # ---------------- SEARCH SCRAPER ----------------
 
@@ -189,10 +237,10 @@ async def fetch_search_jobs():
         for idx, html in enumerate(pages):
             if not html:
                 continue
-        
+
             base_url = SEARCH_PAGES[idx]
             soup = BeautifulSoup(html, "html.parser")
-        
+
             for a in soup.find_all("a", href=True):
                 href = urljoin(base_url, a["href"])
                 title = a.get_text(strip=True)
@@ -204,7 +252,7 @@ async def fetch_search_jobs():
                     job_urls.append(href)
 
         job_urls = list(set(job_urls))
-        log("SEARCH", f"Found {len(job_urls)} candidate jobs")
+        log("SEARCH", f"Found {len(job_urls)} job URLs")
 
         job_tasks = [process_job(session, u) for u in job_urls[:50]]
         results = await asyncio.gather(*job_tasks)
@@ -213,41 +261,30 @@ async def fetch_search_jobs():
             if r:
                 jobs.append(r)
 
-    log("SEARCH", f"Valid jobs after processing: {len(jobs)}")
     return jobs
+
 
 # ---------------- JOB PROCESSING ----------------
 
 async def process_job(session, url):
     if url in CACHE:
-        log("CACHE", f"Skipping cached {url}")
         return None
 
     CACHE.add(url)
 
-    log("JOB", f"Fetching {url}")
-
     html = await fetch(session, url)
     if not html:
-        log("SKIP", f"No HTML: {url}")
         return None
 
     title, company = extract_job_details(html, url)
 
-    log("PARSE", f"{url}")
-    log("PARSE", f"Title: {title}")
-    log("PARSE", f"Company: {company}")
-
     if not title:
-        log("SKIP", f"No title: {url}")
         return None
 
     if not contains_ruby(title):
-        log("SKIP", f"Not ruby: {title}")
         return None
 
     if is_excluded(title):
-        log("SKIP", f"Excluded: {title}")
         return None
 
     return {
@@ -256,15 +293,15 @@ async def process_job(session, url):
         "company": company
     }
 
+
 # ---------------- MAIN ----------------
 
 async def main():
     log("SYSTEM", "Starting Ruby Job Engine")
 
-    jobs = []
-
     store = load_companies()
 
+    jobs = []
     jobs += fetch_rss_jobs()
     jobs += await fetch_search_jobs()
 
@@ -281,8 +318,13 @@ async def main():
 
             soup = BeautifulSoup(html, "html.parser")
 
-            for a in soup.find_all("a", href=True):
-                discover_company(a["href"], store)
+            links = soup.find_all("a", href=True)
+
+            log("DISCOVERY", "Scanning links", len(links))
+
+            for a in links:
+                full_url = urljoin("https://", a["href"])
+                discover_company(full_url, store)
 
     save_companies(store)
 
@@ -300,13 +342,13 @@ async def main():
 
     # ---------------- EMAIL ----------------
 
-    body = f"🔥 ASYNC RUBY ENGINE - {datetime.now().strftime('%Y-%m-%d')}\n\n"
+    body = f"🔥 RUBY ENGINE - {datetime.now().strftime('%Y-%m-%d')}\n\n"
 
     for j in final[:10]:
         body += f"[{j['company']}] {j['title']}\n{j['link']}\n\n"
 
     msg = MIMEText(body)
-    msg["Subject"] = "🔥 Async Ruby Job Engine"
+    msg["Subject"] = "🔥 Ruby Job Engine"
     msg["From"] = EMAIL_SENDER
     msg["To"] = EMAIL_RECEIVER
 
@@ -319,6 +361,7 @@ async def main():
         log("EMAIL", f"Failed: {e}")
 
     log("SYSTEM", "Done")
+
 
 # ---------------- RUN ----------------
 
