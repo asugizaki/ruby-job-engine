@@ -5,6 +5,7 @@ import logging
 import os
 import re
 import smtplib
+from urllib.parse import urlparse
 from email.mime.text import MIMEText
 
 # =========================
@@ -20,7 +21,7 @@ logging.basicConfig(
 )
 
 # =========================
-# EMAIL (GitHub Secrets)
+# EMAIL
 # =========================
 
 EMAIL_SENDER = os.getenv("EMAIL_SENDER")
@@ -30,68 +31,47 @@ EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD")
 EMAIL_ENABLED = all([EMAIL_SENDER, EMAIL_RECEIVER, EMAIL_PASSWORD])
 
 # =========================
-# FILTER (SENIOR ONLY)
+# SEED JOB URLS (YOUR INPUT)
 # =========================
 
-def is_relevant(text: str) -> bool:
-    if not text:
-        return False
-
-    t = text.lower()
-
-    # MUST be Ruby related
-    if not any(k in t for k in ["ruby", "rails", "ruby on rails", "ror"]):
-        return False
-
-    # MUST be senior level
-    senior_signals = [
-        "senior", "sr", "software engineer ii", "engineer ii"
-    ]
-
-    if not any(s in t for s in senior_signals):
-        return False
-
-    # EXCLUDE non-senior / leadership noise
-    excludes = [
-        "junior", "jr", "entry", "graduate",
-        "staff", "principal", "distinguished",
-        "vp", "vice president", "director", "head of",
-        "intern"
-    ]
-
-    if any(x in t for x in excludes):
-        return False
-
-    return True
-
+SEED_URLS = [
+    "https://job-boards.greenhouse.io/novoed/jobs/7707952",
+    "https://job-boards.greenhouse.io/fleetio/jobs/5095381007"
+]
 
 # =========================
-# SALARY EXTRACTION
+# PLATFORM DETECTION
 # =========================
 
-salary_pattern = re.compile(r"(\$?\d{2,3}[kK]?\s?[-–]\s?\$?\d{2,3}[kK]?)")
+def detect_platform(url: str):
+    if "greenhouse.io" in url:
+        return "greenhouse"
+    if "lever.co" in url:
+        return "lever"
+    if "workable.com" in url:
+        return "workable"
+    return None
 
-def extract_salary(text: str):
-    if not text:
-        return "Not specified"
-    m = salary_pattern.search(text)
-    return m.group(1) if m else "Not specified"
+
+def extract_slug(url: str, platform: str):
+    path = urlparse(url).path.strip("/").split("/")
+
+    if platform == "greenhouse":
+        # /company/jobs/id
+        if len(path) >= 2:
+            return path[0]
+    if platform == "lever":
+        # usually /company or /company/jobs
+        return path[0] if path else None
+    if platform == "workable":
+        # /company or /company/j/xxx
+        return path[0] if path else None
+
+    return None
 
 
 # =========================
-# SENIORITY TAG
-# =========================
-
-def detect_seniority(text: str):
-    t = text.lower()
-
-    if "software engineer ii" in t or "engineer ii" in t:
-        return "Senior (II)"
-    return "Senior"
-
-
-# =========================
-# COMPANIES (DYNAMIC)
+# COMPANIES BOOTSTRAP
 # =========================
 
 def load_companies():
@@ -100,14 +80,84 @@ def load_companies():
     with open(COMPANIES_FILE, "r") as f:
         return json.load(f)
 
+
 def save_companies(companies):
     with open(COMPANIES_FILE, "w") as f:
         json.dump(companies, f, indent=2)
 
-def add_company(companies, new):
-    if not any(c["slug"] == new["slug"] and c["platform"] == new["platform"] for c in companies):
-        logging.info(f"[NEW COMPANY] {new}")
-        companies.append(new)
+
+def bootstrap_companies():
+    companies = load_companies()
+
+    for url in SEED_URLS:
+        platform = detect_platform(url)
+        slug = extract_slug(url, platform)
+
+        if not platform or not slug:
+            logging.warning(f"[BOOTSTRAP SKIP] {url}")
+            continue
+
+        entry = {
+            "platform": platform,
+            "slug": slug
+        }
+
+        if entry not in companies:
+            logging.info(f"[BOOTSTRAP ADD] {entry}")
+            companies.append(entry)
+
+    save_companies(companies)
+    return companies
+
+
+# =========================
+# FILTERING (SENIOR + CANADA SAFE)
+# =========================
+
+def is_relevant(text: str) -> bool:
+    if not text:
+        return False
+
+    t = text.lower()
+
+    if not any(k in t for k in ["ruby", "rails", "ruby on rails", "ror"]):
+        return False
+
+    if not any(s in t for s in ["senior", "sr", "software engineer ii"]):
+        return False
+
+    if any(x in t for x in [
+        "junior", "entry", "graduate",
+        "staff", "principal", "vp", "director"
+    ]):
+        return False
+
+    # Canada-safe heuristic
+    blocked_geo = [
+        "india only", "us only", "europe only",
+        "uk only", "apac only"
+    ]
+
+    if any(x in t for x in blocked_geo):
+        return False
+
+    return True
+
+
+# =========================
+# UTIL
+# =========================
+
+def extract_salary(text: str):
+    m = re.search(r"(\$?\d{2,3}[kK]?\s?[-–]\s?\$?\d{2,3}[kK]?)", text or "")
+    return m.group(1) if m else "Not specified"
+
+
+def detect_seniority(text: str):
+    t = text.lower()
+    if "software engineer ii" in t:
+        return "Senior (II)"
+    return "Senior"
 
 
 # =========================
@@ -152,7 +202,6 @@ async def greenhouse(session, slug):
                 "source": "greenhouse"
             })
 
-    logging.info(f"[GREENHOUSE] {slug} -> {len(jobs)}")
     return jobs
 
 
@@ -180,19 +229,49 @@ async def lever(session, slug):
                 "source": "lever"
             })
 
-    logging.info(f"[LEVER] {slug} -> {len(jobs)}")
     return jobs
 
 
 # =========================
-# REMOTE SOURCES
+# WORKABLE (FIXED SUPPORT)
 # =========================
 
-async def remotive(session):
-    url = "https://remotive.com/api/remote-jobs"
-    logging.info("[REMOTIVE] fetching")
+async def workable(session, slug):
+    url = f"https://apply.workable.com/api/v3/accounts/{slug}/jobs"
+    logging.info(f"[WORKABLE] {slug}")
 
-    data = await fetch_json(session, url) or {}
+    data = await fetch_json(session, url)
+    if not data:
+        return []
+
+    jobs = []
+    for j in data.get("results", []):
+        text = j.get("title", "") + j.get("description", "")
+
+        if is_relevant(text):
+            jobs.append({
+                "company": slug,
+                "title": j.get("title"),
+                "url": j.get("url"),
+                "salary": "Not specified",
+                "seniority": detect_seniority(text),
+                "source": "workable"
+            })
+
+    return jobs
+
+
+# =========================
+# HIMALAYAS (RESTORED)
+# =========================
+
+async def himalayas(session):
+    url = "https://himalayas.app/api/jobs?query=ruby"
+    logging.info("[HIMALAYAS] fetching")
+
+    data = await fetch_json(session, url)
+    if not data:
+        return []
 
     jobs = []
     for j in data.get("jobs", []):
@@ -200,40 +279,15 @@ async def remotive(session):
 
         if is_relevant(text):
             jobs.append({
-                "company": j.get("company_name"),
+                "company": j.get("company"),
                 "title": j.get("title"),
                 "url": j.get("url"),
                 "salary": "Not specified",
                 "seniority": "Senior",
-                "source": "remotive"
+                "source": "himalayas"
             })
 
-    logging.info(f"[REMOTIVE] -> {len(jobs)}")
-    return jobs
-
-
-async def remoteok(session):
-    url = "https://remoteok.com/remote-ruby-jobs.json"
-    logging.info("[REMOTEOK] fetching")
-
-    data = await fetch_json(session, url) or []
-
-    jobs = []
-    for j in data:
-        if isinstance(j, dict):
-            text = j.get("position", "") + j.get("description", "")
-
-            if is_relevant(text):
-                jobs.append({
-                    "company": j.get("company"),
-                    "title": j.get("position"),
-                    "url": j.get("url"),
-                    "salary": "Not specified",
-                    "seniority": detect_seniority(text),
-                    "source": "remoteok"
-                })
-
-    logging.info(f"[REMOTEOK] -> {len(jobs)}")
+    logging.info(f"[HIMALAYAS] -> {len(jobs)}")
     return jobs
 
 
@@ -242,11 +296,7 @@ async def remoteok(session):
 # =========================
 
 def send_email(jobs):
-    if not EMAIL_ENABLED:
-        logging.warning("[EMAIL] Missing credentials")
-        return
-
-    if not jobs:
+    if not EMAIL_ENABLED or not jobs:
         return
 
     grouped = {}
@@ -258,11 +308,8 @@ def send_email(jobs):
 
     for company, items in grouped.items():
         lines.append(f"\n================ {company.upper()} ================\n")
-
         for j in items:
-            lines.append(
-                f"[{j['seniority']}] {j['title']} | {j['salary']} | {j['url']}"
-            )
+            lines.append(f"[{j['seniority']}] {j['title']} | {j['salary']} | {j['url']}")
 
     body = "\n".join(lines)
 
@@ -283,11 +330,12 @@ def send_email(jobs):
 # =========================
 
 async def main():
-    logging.info("[SYSTEM] Starting Job Engine")
+    logging.info("[SYSTEM] Bootstrapping companies")
 
+    bootstrap_companies()
     companies = load_companies()
+
     all_jobs = []
-    discovered = []
 
     async with aiohttp.ClientSession() as session:
 
@@ -298,33 +346,22 @@ async def main():
                 tasks.append(greenhouse(session, c["slug"]))
             elif c["platform"] == "lever":
                 tasks.append(lever(session, c["slug"]))
+            elif c["platform"] == "workable":
+                tasks.append(workable(session, c["slug"]))
 
-        tasks.append(remotive(session))
-        tasks.append(remoteok(session))
+        tasks.append(himalayas(session))
 
         results = await asyncio.gather(*tasks)
 
         for group in results:
-            for job in group:
-                all_jobs.append(job)
-                discovered.append({
-                    "platform": job.get("source", "unknown"),
-                    "slug": job["company"]
-                })
+            all_jobs.extend(group)
 
-    # save jobs
     with open(OUTPUT_FILE, "w") as f:
         json.dump(all_jobs, f, indent=2)
 
-    # auto-update companies
-    for c in discovered:
-        add_company(companies, c)
-
-    save_companies(companies)
-
     send_email(all_jobs)
 
-    logging.info(f"[DONE] {len(all_jobs)} senior Ruby jobs")
+    logging.info(f"[DONE] Total jobs: {len(all_jobs)}")
 
 
 if __name__ == "__main__":
