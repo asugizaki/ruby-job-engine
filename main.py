@@ -8,7 +8,7 @@ import re
 import smtplib
 import logging
 import os
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 from email.mime.text import MIMEText
 from datetime import datetime
 from bs4 import BeautifulSoup
@@ -59,14 +59,19 @@ CACHE = set()
 def load_companies():
     try:
         with open(COMPANY_STORE_FILE, "r") as f:
-            return json.load(f)
+            data = json.load(f)
+            log("STATE", f"Loaded companies: {sum(len(v) for v in data.values())}")
+            return data
     except:
+        log("STATE", "No existing company file, creating new")
         return {"greenhouse": [], "lever": [], "ashby": []}
 
 
 def save_companies(data):
     with open(COMPANY_STORE_FILE, "w") as f:
         json.dump(data, f, indent=2)
+    log("STATE", f"Saved companies: {sum(len(v) for v in data.values())}")
+
 
 def detect_platform(url):
     if "greenhouse" in url:
@@ -98,12 +103,10 @@ def discover_company(url, store):
 # ---------------- HELPERS ----------------
 
 def contains_ruby(text):
-    t = text.lower()
-    return any(k in t for k in RUBY_KEYWORDS)
+    return any(k in text.lower() for k in RUBY_KEYWORDS)
 
 def is_excluded(text):
-    t = text.lower()
-    return any(k in t for k in EXCLUDE_KEYWORDS)
+    return any(k in text.lower() for k in EXCLUDE_KEYWORDS)
 
 def is_remote(text):
     return "remote" in text.lower()
@@ -112,6 +115,7 @@ def is_remote(text):
 
 async def fetch(session, url):
     try:
+        log("FETCH", url)
         async with session.get(url, timeout=20) as resp:
             return await resp.text()
     except Exception as e:
@@ -138,26 +142,33 @@ def fetch_rss_jobs():
                         "company": "rss"
                     })
 
-            log("RSS", f"Parsed {feed}")
+            log("RSS", f"Parsed {feed} -> {len(data.entries)} entries")
         except Exception as e:
             log("RSS", f"Error {feed}: {e}")
 
+    log("RSS", f"Total RSS jobs: {len(jobs)}")
     return jobs
 
-# ---------------- PLAYWRIGHT FALLBACK ----------------
+# ---------------- PARSER ----------------
 
-async def fetch_js(url):
-    try:
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=True)
-            page = await browser.new_page()
-            await page.goto(url, timeout=30000)
-            html = await page.content()
-            await browser.close()
-            return html
-    except Exception as e:
-        log("PLAYWRIGHT", f"Failed {url}: {e}")
-        return None
+def extract_job_details(html, url):
+    soup = BeautifulSoup(html, "html.parser")
+
+    title = None
+    company = None
+
+    # Try common patterns
+    if soup.find("h1"):
+        title = soup.find("h1").get_text(strip=True)
+
+    if soup.find("h2"):
+        company = soup.find("h2").get_text(strip=True)
+
+    # fallback
+    if not company:
+        company = urlparse(url).netloc
+
+    return title, company
 
 # ---------------- SEARCH SCRAPER ----------------
 
@@ -180,26 +191,19 @@ async def fetch_search_jobs():
                 continue
         
             base_url = SEARCH_PAGES[idx]
-        
             soup = BeautifulSoup(html, "html.parser")
         
             for a in soup.find_all("a", href=True):
-                href = a["href"]
+                href = urljoin(base_url, a["href"])
                 title = a.get_text(strip=True)
-        
+
                 if len(title) < 5:
                     continue
-        
-                # FIX: resolve relative URLs properly
-                href = urljoin(base_url, href)
-        
-                # Skip junk links
-                if not href.startswith("http"):
-                    continue
-        
+
                 if contains_ruby(title):
                     job_urls.append(href)
 
+        job_urls = list(set(job_urls))
         log("SEARCH", f"Found {len(job_urls)} candidate jobs")
 
         job_tasks = [process_job(session, u) for u in job_urls[:50]]
@@ -209,12 +213,14 @@ async def fetch_search_jobs():
             if r:
                 jobs.append(r)
 
+    log("SEARCH", f"Valid jobs after processing: {len(jobs)}")
     return jobs
 
 # ---------------- JOB PROCESSING ----------------
 
 async def process_job(session, url):
     if url in CACHE:
+        log("CACHE", f"Skipping cached {url}")
         return None
 
     CACHE.add(url)
@@ -223,21 +229,31 @@ async def process_job(session, url):
 
     html = await fetch(session, url)
     if not html:
+        log("SKIP", f"No HTML: {url}")
         return None
 
-    if not contains_ruby(html):
+    title, company = extract_job_details(html, url)
+
+    log("PARSE", f"{url}")
+    log("PARSE", f"Title: {title}")
+    log("PARSE", f"Company: {company}")
+
+    if not title:
+        log("SKIP", f"No title: {url}")
         return None
 
-    if is_excluded(html):
+    if not contains_ruby(title):
+        log("SKIP", f"Not ruby: {title}")
         return None
 
-    if not is_remote(html):
+    if is_excluded(title):
+        log("SKIP", f"Excluded: {title}")
         return None
 
     return {
-        "title": "Ruby Job",
+        "title": title,
         "link": url,
-        "company": "discovered"
+        "company": company
     }
 
 # ---------------- MAIN ----------------
@@ -247,13 +263,9 @@ async def main():
 
     jobs = []
 
-    # LOAD COMPANY GRAPH
     store = load_companies()
 
-    # RSS
     jobs += fetch_rss_jobs()
-
-    # SEARCH
     jobs += await fetch_search_jobs()
 
     # ---------------- COMPANY DISCOVERY ----------------
@@ -286,6 +298,8 @@ async def main():
 
     log("SYSTEM", f"Total jobs: {len(final)}")
 
+    # ---------------- EMAIL ----------------
+
     body = f"🔥 ASYNC RUBY ENGINE - {datetime.now().strftime('%Y-%m-%d')}\n\n"
 
     for j in final[:10]:
@@ -295,10 +309,6 @@ async def main():
     msg["Subject"] = "🔥 Async Ruby Job Engine"
     msg["From"] = EMAIL_SENDER
     msg["To"] = EMAIL_RECEIVER
-
-    log("DEBUG", f"Sender: {EMAIL_SENDER}")
-    log("DEBUG", f"Receiver: {EMAIL_RECEIVER}")
-    log("DEBUG", f"Password exists: {EMAIL_PASSWORD is not None}")
 
     try:
         with smtplib.SMTP_SSL("smtp.gmail.com", 465) as s:
