@@ -4,7 +4,6 @@
 import asyncio
 import aiohttp
 import json
-import re
 import smtplib
 import logging
 import os
@@ -62,12 +61,10 @@ def load_companies():
     try:
         with open(COMPANY_STORE_FILE, "r") as f:
             data = json.load(f)
-
             log("STATE", "Loaded companies", {k: len(v) for k, v in data.items()})
             return data
-
     except Exception as e:
-        log("STATE", f"No existing file, creating new: {e}")
+        log("STATE", f"No existing file, creating new | {e}")
         return {"greenhouse": [], "lever": [], "ashby": []}
 
 
@@ -77,73 +74,99 @@ def save_companies(data):
     with open(COMPANY_STORE_FILE, "w") as f:
         json.dump(data, f, indent=2)
 
-
 # ---------------- PLATFORM DETECTION ----------------
 
 def detect_platform(url):
     u = url.lower()
 
-    if "greenhouse.io" in u:
+    if "greenhouse" in u:
         return "greenhouse"
-    if "lever.co" in u:
+    if "lever" in u:
         return "lever"
-    if "ashbyhq.com" in u or "ashby" in u:
+    if "ashby" in u:
         return "ashby"
 
     return None
 
-
-# ---------------- COMPANY EXTRACTION (FIXED) ----------------
+# ---------------- COMPANY EXTRACTION ----------------
 
 def extract_company_from_url(url):
     try:
         url = url.split("?")[0].rstrip("/")
         parts = url.split("/")
 
+        log("PARSE", "Analyzing URL", url)
+
         # GREENHOUSE
-        # boards.greenhouse.io/company/jobs/123
         if "greenhouse" in url and "boards.greenhouse.io" in url:
             idx = parts.index("boards.greenhouse.io")
-            return parts[idx + 1]
+            company = parts[idx + 1]
+            log("PARSE", "Greenhouse company extracted", company)
+            return company
 
         # LEVER
-        # jobs.lever.co/company/job-slug
         if "lever.co" in url:
             idx = parts.index("jobs.lever.co")
-            return parts[idx + 1]
+            company = parts[idx + 1]
+            log("PARSE", "Lever company extracted", company)
+            return company
 
         # ASHBY
-        # jobs.ashbyhq.com/company/job-slug
         if "ashby" in url:
             idx = [i for i, p in enumerate(parts) if "ashby" in p][0]
-            return parts[idx + 1]
+            company = parts[idx + 1]
+            log("PARSE", "Ashby company extracted", company)
+            return company
 
+        log("PARSE", "No match for platform URL", url)
         return None
 
     except Exception as e:
-        log("DISCOVERY", f"Company parse failed: {url}", str(e))
+        log("PARSE", "FAILED extracting company", {"url": url, "error": str(e)})
         return None
-
 
 # ---------------- DISCOVERY ----------------
 
-def discover_company(url, store):
+def discover_company(raw_url, store):
+    if not raw_url:
+        return
+
+    url = raw_url.strip()
+
+    # skip garbage
+    if url.startswith("/"):
+        log("DISCOVERY", "Skipping relative URL", url)
+        return
+
+    if "http" not in url:
+        log("DISCOVERY", "Skipping invalid URL", url)
+        return
+
+    log("DISCOVERY", "Checking URL", url)
+
     platform = detect_platform(url)
+
     if not platform:
+        log("DISCOVERY", "No platform detected", url)
         return
 
     company = extract_company_from_url(url)
 
     if not company:
+        log("DISCOVERY", "No company extracted", url)
         return
 
-    if company not in store[platform]:
-        store[platform].append(company)
-        log("DISCOVERY", "NEW COMPANY FOUND", {
-            "company": company,
-            "platform": platform
-        })
+    if company in store[platform]:
+        log("DISCOVERY", "Already exists", {"company": company, "platform": platform})
+        return
 
+    store[platform].append(company)
+
+    log("DISCOVERY", "NEW COMPANY ADDED", {
+        "company": company,
+        "platform": platform,
+        "url": url
+    })
 
 # ---------------- HELPERS ----------------
 
@@ -156,8 +179,7 @@ def is_excluded(text):
 def is_remote(text):
     return "remote" in text.lower()
 
-
-# ---------------- ASYNC HTTP ----------------
+# ---------------- HTTP ----------------
 
 async def fetch(session, url):
     try:
@@ -165,9 +187,8 @@ async def fetch(session, url):
         async with session.get(url, timeout=20) as resp:
             return await resp.text()
     except Exception as e:
-        log("HTTP", f"Failed {url}: {e}")
+        log("HTTP", f"Failed {url}", str(e))
         return None
-
 
 # ---------------- RSS ----------------
 
@@ -192,44 +213,19 @@ def fetch_rss_jobs():
             log("RSS", f"{feed} -> {len(data.entries)} entries")
 
         except Exception as e:
-            log("RSS", f"Error {feed}: {e}")
+            log("RSS", "Error feed", str(e))
 
-    log("RSS", f"Total RSS jobs: {len(jobs)}")
+    log("RSS", f"Total jobs: {len(jobs)}")
     return jobs
 
-
-# ---------------- JOB PARSER ----------------
-
-def extract_job_details(html, url):
-    soup = BeautifulSoup(html, "html.parser")
-
-    title = None
-    company = None
-
-    if soup.find("h1"):
-        title = soup.find("h1").get_text(strip=True)
-
-    if soup.find("h2"):
-        company = soup.find("h2").get_text(strip=True)
-
-    if not company:
-        company = urlparse(url).netloc
-
-    return title, company
-
-
-# ---------------- SEARCH SCRAPER ----------------
+# ---------------- SEARCH ----------------
 
 async def fetch_search_jobs():
     jobs = []
 
     async with aiohttp.ClientSession() as session:
 
-        tasks = []
-        for url in SEARCH_PAGES:
-            log("SEARCH", f"Scanning {url}")
-            tasks.append(fetch(session, url))
-
+        tasks = [fetch(session, url) for url in SEARCH_PAGES]
         pages = await asyncio.gather(*tasks)
 
         job_urls = []
@@ -245,6 +241,8 @@ async def fetch_search_jobs():
                 href = urljoin(base_url, a["href"])
                 title = a.get_text(strip=True)
 
+                log("DISCOVERY", "Found link", {"raw": a["href"], "full": href})
+
                 if len(title) < 5:
                     continue
 
@@ -252,7 +250,7 @@ async def fetch_search_jobs():
                     job_urls.append(href)
 
         job_urls = list(set(job_urls))
-        log("SEARCH", f"Found {len(job_urls)} job URLs")
+        log("SEARCH", f"Job URLs found: {len(job_urls)}")
 
         job_tasks = [process_job(session, u) for u in job_urls[:50]]
         results = await asyncio.gather(*job_tasks)
@@ -262,7 +260,6 @@ async def fetch_search_jobs():
                 jobs.append(r)
 
     return jobs
-
 
 # ---------------- JOB PROCESSING ----------------
 
@@ -276,7 +273,10 @@ async def process_job(session, url):
     if not html:
         return None
 
-    title, company = extract_job_details(html, url)
+    soup = BeautifulSoup(html, "html.parser")
+
+    title = soup.find("h1").get_text(strip=True) if soup.find("h1") else None
+    company = soup.find("h2").get_text(strip=True) if soup.find("h2") else urlparse(url).netloc
 
     if not title:
         return None
@@ -293,11 +293,10 @@ async def process_job(session, url):
         "company": company
     }
 
-
 # ---------------- MAIN ----------------
 
 async def main():
-    log("SYSTEM", "Starting Ruby Job Engine")
+    log("SYSTEM", "Starting Ruby Engine")
 
     store = load_companies()
 
@@ -305,7 +304,7 @@ async def main():
     jobs += fetch_rss_jobs()
     jobs += await fetch_search_jobs()
 
-    # ---------------- COMPANY DISCOVERY ----------------
+    # ---------------- DISCOVERY ----------------
     log("DISCOVERY", "Extracting companies")
 
     async with aiohttp.ClientSession() as session:
@@ -342,7 +341,7 @@ async def main():
 
     # ---------------- EMAIL ----------------
 
-    body = f"🔥 RUBY ENGINE - {datetime.now().strftime('%Y-%m-%d')}\n\n"
+    body = f"🔥 RUBY ENGINE {datetime.now().strftime('%Y-%m-%d')}\n\n"
 
     for j in final[:10]:
         body += f"[{j['company']}] {j['title']}\n{j['link']}\n\n"
@@ -358,10 +357,9 @@ async def main():
             s.send_message(msg)
         log("EMAIL", "Sent successfully")
     except Exception as e:
-        log("EMAIL", f"Failed: {e}")
+        log("EMAIL", "Failed", str(e))
 
     log("SYSTEM", "Done")
-
 
 # ---------------- RUN ----------------
 
