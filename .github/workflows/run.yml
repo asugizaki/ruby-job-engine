@@ -32,3 +32,10 @@ jobs:
           EMAIL_SENDER: ${{ secrets.EMAIL_SENDER }}
           EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
           EMAIL_RECEIVER: ${{ secrets.EMAIL_RECEIVER }}
+      - name: Commit companies.json
+        run: |
+          git config user.name "github-actions"
+          git config user.email "actions@github.com"
+          git add companies.json
+          git commit -m "Update companies" || echo "No changes"
+          git push
