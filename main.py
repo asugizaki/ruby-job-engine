@@ -8,6 +8,7 @@ import re
 import smtplib
 import logging
 import os
+from urllib.parse import urljoin
 from email.mime.text import MIMEText
 from datetime import datetime
 from bs4 import BeautifulSoup
@@ -174,22 +175,28 @@ async def fetch_search_jobs():
 
         job_urls = []
 
-        for html in pages:
+        for idx, html in enumerate(pages):
             if not html:
                 continue
-
+        
+            base_url = SEARCH_PAGES[idx]
+        
             soup = BeautifulSoup(html, "html.parser")
-
+        
             for a in soup.find_all("a", href=True):
                 href = a["href"]
                 title = a.get_text(strip=True)
-
+        
                 if len(title) < 5:
                     continue
-
-                if href.startswith("/"):
-                    href = "https://example.com" + href
-
+        
+                # FIX: resolve relative URLs properly
+                href = urljoin(base_url, href)
+        
+                # Skip junk links
+                if not href.startswith("http"):
+                    continue
+        
                 if contains_ruby(title):
                     job_urls.append(href)
 
