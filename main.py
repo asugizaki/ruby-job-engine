@@ -1,5 +1,5 @@
-# ELITE RUBY JOB INTELLIGENCE SYSTEM (HIMALAYAS + RUBYONREMOTE)
-# ------------------------------------------------------------
+# ELITE RUBY JOB INTELLIGENCE SYSTEM (HIMALAYAS + RUBYONREMOTE PLAYWRIGHT)
+# -----------------------------------------------------------------------
 
 import asyncio
 import aiohttp
@@ -12,6 +12,7 @@ from urllib.parse import urljoin
 from email.mime.text import MIMEText
 from datetime import datetime
 from bs4 import BeautifulSoup
+from playwright.async_api import async_playwright
 
 # ---------------- LOGGING ----------------
 logging.basicConfig(
@@ -52,10 +53,7 @@ def is_valid_engineer_role(title):
     if any(bad in t for bad in EXCLUDE_KEYWORDS):
         return False
 
-    if any(good in t for good in ENGINEER_KEYWORDS):
-        return True
-
-    return False
+    return any(good in t for good in ENGINEER_KEYWORDS)
 
 def is_canada_friendly(text):
     t = text.lower()
@@ -90,47 +88,13 @@ def extract_salary(text):
 def load_companies():
     try:
         with open(COMPANY_STORE_FILE, "r") as f:
-            data = json.load(f)
-            log("STATE", f"Loaded {sum(len(v) for v in data.values())} companies")
-            return data
+            return json.load(f)
     except:
         return {"greenhouse": [], "lever": [], "ashby": [], "workable": []}
 
 def save_companies(data):
     with open(COMPANY_STORE_FILE, "w") as f:
         json.dump(data, f, indent=2)
-    log("STATE", f"Saved {sum(len(v) for v in data.values())} companies")
-
-def detect_platform(url):
-    if "greenhouse" in url:
-        return "greenhouse"
-    if "lever" in url:
-        return "lever"
-    if "ashby" in url:
-        return "ashby"
-    if "workable" in url:
-        return "workable"
-    return None
-
-def extract_slug(url):
-    parts = url.split("/")
-    for p in parts:
-        if p and p not in ["jobs", "job", "boards"]:
-            return p
-    return None
-
-def discover_company(url, store):
-    platform = detect_platform(url)
-    if not platform:
-        return
-
-    slug = extract_slug(url)
-    if not slug:
-        return
-
-    if slug not in store[platform]:
-        store[platform].append(slug)
-        log("DISCOVERY", f"{platform}: {slug}")
 
 # ---------------- FETCH ----------------
 
@@ -171,32 +135,42 @@ async def fetch_himalayas(session):
 
     return jobs
 
-# ---------------- RUBYONREMOTE ----------------
+# ---------------- RUBYONREMOTE (PLAYWRIGHT) ----------------
 
-async def fetch_rubyonremote(session):
-    log("RUBYONREMOTE", "Fetching Canada page")
+async def fetch_rubyonremote():
+    log("RUBYONREMOTE", "Launching browser")
 
-    url = "https://rubyonremote.com/remote-jobs-in-canada/"
-    html = await fetch(session, url)
+    jobs = []
 
-    if not html:
-        return []
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True)
+        page = await browser.new_page()
+
+        url = "https://rubyonremote.com/remote-jobs-in-canada/"
+        await page.goto(url, timeout=60000)
+
+        await page.wait_for_timeout(5000)  # wait for Cloudflare + JS
+
+        html = await page.content()
+        await browser.close()
 
     soup = BeautifulSoup(html, "html.parser")
 
     links = []
+
     for a in soup.find_all("a", href=True):
         href = a["href"]
 
-        # filter actual job links
-        if "/jobs/" in href or "/companies/" in href:
-            links.append(urljoin(url, href))
+        if "/jobs/" in href:
+            full = urljoin(url, href)
+            links.append(full)
 
     links = list(set(links))
     log("RUBYONREMOTE", f"Found {len(links)} links")
 
-    tasks = [process_job(session, u) for u in links[:30]]
-    results = await asyncio.gather(*tasks)
+    async with aiohttp.ClientSession() as session:
+        tasks = [process_job(session, u) for u in links[:30]]
+        results = await asyncio.gather(*tasks)
 
     jobs = [r for r in results if r]
     log("RUBYONREMOTE", f"Valid jobs: {len(jobs)}")
@@ -248,25 +222,19 @@ async def process_job(session, url):
 async def main():
     log("SYSTEM", "Starting Job Engine")
 
-    store = load_companies()
     jobs = []
 
     async with aiohttp.ClientSession() as session:
         jobs += await fetch_himalayas(session)
-        jobs += await fetch_rubyonremote(session)
 
-    # COMPANY DISCOVERY
-    for j in jobs:
-        discover_company(j["link"], store)
+    # RubyOnRemote uses Playwright separately
+    jobs += await fetch_rubyonremote()
 
-    save_companies(store)
-
-    # GROUP BY COMPANY
+    # GROUP
     grouped = {}
     for j in jobs:
         grouped.setdefault(j["company"], []).append(j)
 
-    # EMAIL
     body = f"🔥 RUBY JOBS - {datetime.now().strftime('%Y-%m-%d')}\n\n"
 
     for company, js in grouped.items():
