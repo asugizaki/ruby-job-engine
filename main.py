@@ -48,6 +48,9 @@ EMAIL_SENDER = os.getenv("EMAIL_SENDER")
 EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD")
 EMAIL_RECEIVER = os.getenv("EMAIL_RECEIVER")
 
+if not EMAIL_SENDER or not EMAIL_PASSWORD or not EMAIL_RECEIVER:
+    raise ValueError("Missing email environment variables")
+
 CACHE = set()
 
 # ---------------- COMPANY STORAGE ----------------
@@ -285,6 +288,10 @@ async def main():
     msg["Subject"] = "🔥 Async Ruby Job Engine"
     msg["From"] = EMAIL_SENDER
     msg["To"] = EMAIL_RECEIVER
+
+    log("DEBUG", f"Sender: {EMAIL_SENDER}")
+    log("DEBUG", f"Receiver: {EMAIL_RECEIVER}")
+    log("DEBUG", f"Password exists: {EMAIL_PASSWORD is not None}")
 
     try:
         with smtplib.SMTP_SSL("smtp.gmail.com", 465) as s:
