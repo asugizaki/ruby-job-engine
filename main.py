@@ -1,395 +1,273 @@
-import os
-import json
 import asyncio
 import aiohttp
-import logging
+import json
 import re
-from collections import defaultdict
-from urllib.parse import urlparse, urljoin
+import smtplib
+import logging
+import os
+from urllib.parse import urljoin, urlparse
+from email.mime.text import MIMEText
+from datetime import datetime
+from bs4 import BeautifulSoup
 
-# =========================
-# LOGGING
-# =========================
+# ---------------- LOGGING ----------------
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+logger = logging.getLogger(__name__)
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s"
-)
+def log(step, msg):
+    logger.info(f"[{step}] {msg}")
 
-# =========================
-# CONFIG
-# =========================
+# ---------------- CONFIG ----------------
+RUBY_KEYWORDS = ["ruby", "rails"]
 
-COMPANIES_FILE = "companies.json"
-
-INCLUDE_KEYWORDS = [
-    "engineer",
-    "developer",
-    "backend",
-    "back end",
-    "back-end",
-    "software",
-    "rails"
+GOOD_ROLE_KEYWORDS = [
+    "engineer", "developer", "backend", "back-end",
+    "fullstack", "full-stack", "software"
 ]
 
-EXCLUDE_KEYWORDS = [
-    "staff",
-    "principal",
-    "vp",
-    "director",
-    "head",
-    "lead",
-    "manager",
-    "architect",
-    "intern",
-    "junior"
+EXCLUDE_LEVELS = [
+    "junior", "jr", "staff", "principal", "lead", "manager", "vp", "director", "head"
 ]
 
-CANADA_KEYWORDS = ["canada", "remote", "ca"]
+ALLOWED_LEVELS = [
+    "senior", "sr", "intermediate", "mid", "mid-level"
+]
 
-CACHE = set()
+EMAIL_SENDER = os.getenv("EMAIL_SENDER")
+EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD")
+EMAIL_RECEIVER = os.getenv("EMAIL_RECEIVER")
 
-# =========================
-# FILE
-# =========================
+# ---------------- HELPERS ----------------
 
-def load_companies():
-    if not os.path.exists(COMPANIES_FILE):
-        return []
-    return json.load(open(COMPANIES_FILE))
+def contains_ruby(text):
+    return any(k in text.lower() for k in RUBY_KEYWORDS)
 
-def save_companies(c):
-    json.dump(c, open(COMPANIES_FILE, "w"), indent=2)
+def is_engineering_role(text):
+    t = text.lower()
+    return any(k in t for k in GOOD_ROLE_KEYWORDS)
 
-# =========================
-# NORMALIZATION (FIX)
-# =========================
+def is_excluded_level(text):
+    t = text.lower()
+    return any(k in t for k in EXCLUDE_LEVELS)
 
-def normalize(text):
-    text = text.lower()
-    text = text.replace("-", " ")
-    text = re.sub(r"\s+", " ", text)
-    return text.strip()
+def is_allowed_level(text):
+    t = text.lower()
+    return any(k in t for k in ALLOWED_LEVELS)
 
-# =========================
-# SALARY (ROBUST)
-# =========================
+def is_valid_role(title):
+    t = title.lower()
+
+    if not is_engineering_role(t):
+        return False, "NOT_ENGINEER"
+
+    if is_excluded_level(t):
+        return False, "EXCLUDED_LEVEL"
+
+    # allow senior OR intermediate OR unspecified
+    return True, "VALID"
+
+def is_valid_location(text):
+    t = text.lower()
+
+    if any(x in t for x in ["canada", "north america", "worldwide", "anywhere"]):
+        return True
+
+    return False
 
 def extract_salary(text):
-    if not text:
-        return None
-
-    t = text.replace("—", "-").replace("–", "-").replace(",", "")
-
     patterns = [
-        r"\$\d{5,6}\s*-\s*\$\d{5,6}",
-        r"\$\d{2,3}k\s*-\s*\$\d{2,3}k",
-        r"\$\d{5,6}"
+        r"\$[\d,]{2,3}(?:,\d{3})*(?:\s*[-—–]\s*\$?[\d,]{2,3}(?:,\d{3})*)?",
+        r"[\d,]{2,3}(?:,\d{3})*\s*(?:usd|cad)",
     ]
 
     for p in patterns:
-        m = re.search(p, t, re.IGNORECASE)
-        if m:
-            return m.group(0)
+        match = re.search(p, text, re.IGNORECASE)
+        if match:
+            return match.group(0)
 
     return None
 
-async def fetch_salary_from_page(session, url):
+# ---------------- FETCH ----------------
+
+async def fetch(session, url):
     try:
-        async with session.get(url, timeout=20) as r:
-            html = await r.text()
-            return extract_salary(html)
-    except:
+        async with session.get(url, timeout=20) as resp:
+            if resp.status != 200:
+                log("HTTP", f"{resp.status} {url}")
+                return None
+            return await resp.text()
+    except Exception as e:
+        log("ERROR", f"{url} -> {e}")
         return None
 
-# =========================
-# FILTERING (FIXED)
-# =========================
+# ---------------- PARSE ----------------
 
-def is_valid(title, text):
-    raw = title
-    title = normalize(title)
+def parse_job(html, url):
+    soup = BeautifulSoup(html, "html.parser")
 
-    # Must be some kind of engineer/dev
-    if not any(k in title for k in INCLUDE_KEYWORDS):
-        return False, "NOT_ENGINEER"
+    title = None
+    if soup.find("h1"):
+        title = soup.find("h1").get_text(strip=True)
 
-    # Reject only clearly unwanted roles
-    if any(k in title for k in EXCLUDE_KEYWORDS):
-        return False, "EXCLUDED_ROLE"
+    if not title:
+        title = soup.title.string if soup.title else ""
 
-    full = normalize(title + " " + text)
+    text = soup.get_text(" ", strip=True)
 
-    if not any(k in full for k in CANADA_KEYWORDS):
-        return False, "NOT_CANADA"
+    company = urlparse(url).netloc
+    salary = extract_salary(text)
 
-    return True, "OK"
+    log("PARSE", f"{url}")
+    log("PARSE", f"Title: {title}")
+    log("PARSE", f"Salary: {salary}")
 
-def log_result(status, job):
-    logging.info(f"[{status}] {job['title']} | {job['url']}")
+    # ---------------- FILTERS ----------------
 
-# =========================
-# COMPANY DETECTION
-# =========================
+    valid_role, reason = is_valid_role(title)
+    if not valid_role:
+        log("REJECT", f"{url} [{reason}]")
+        return None
 
-def detect_company(url):
-    try:
-        domain = urlparse(url).netloc
-        path = urlparse(url).path.strip("/").split("/")
+    if not contains_ruby(text):
+        log("REJECT", f"{url} [NOT_RUBY]")
+        return None
 
-        if "greenhouse" in domain:
-            return {"platform": "greenhouse", "slug": path[0]}
-        if "lever" in domain:
-            return {"platform": "lever", "slug": path[0]}
-        if "ashby" in domain:
-            return {"platform": "ashby", "slug": path[0]}
-        if "workable" in domain:
-            return {"platform": "workable", "slug": path[0]}
-    except:
-        pass
+    if not is_valid_location(text):
+        log("REJECT", f"{url} [NOT_CANADA]")
+        return None
 
-    return None
+    log("ACCEPT", f"{title}")
 
-def update_companies(existing, jobs):
-    seen = set((c["platform"], c["slug"]) for c in existing)
+    return {
+        "title": title,
+        "company": company,
+        "link": url,
+        "salary": salary or "N/A"
+    }
 
-    for j in jobs:
-        c = detect_company(j["url"])
-        if not c:
-            continue
-
-        key = (c["platform"], c["slug"])
-
-        if key not in seen:
-            logging.info(f"[NEW COMPANY] {c}")
-            existing.append(c)
-            seen.add(key)
-
-    return existing
-
-# =========================
-# GREENHOUSE
-# =========================
-
-async def fetch_greenhouse(session, slug):
-    url = f"https://boards-api.greenhouse.io/v1/boards/{slug}/jobs"
-    logging.info(f"[GREENHOUSE] {slug}")
-
-    try:
-        async with session.get(url) as r:
-            if r.status != 200:
-                logging.warning(f"[GH {slug}] {r.status}")
-                return []
-            data = await r.json()
-    except:
-        return []
-
-    jobs = []
-
-    for j in data.get("jobs", []):
-        title = j.get("title", "")
-        desc = j.get("content", "")
-        link = j.get("absolute_url")
-
-        job = {
-            "company": slug,
-            "title": title,
-            "url": link,
-            "salary": extract_salary(desc),
-        }
-
-        valid, reason = is_valid(title, desc)
-
-        if not valid:
-            log_result(f"REJECT-{reason}", job)
-            continue
-
-        if not job["salary"]:
-            job["salary"] = await fetch_salary_from_page(session, link)
-
-        job["salary"] = job["salary"] or "Not specified"
-
-        log_result("ACCEPT", job)
-        jobs.append(job)
-
-    return jobs
-
-# =========================
-# LEVER
-# =========================
-
-async def fetch_lever(session, slug):
-    url = f"https://api.lever.co/v0/postings/{slug}?mode=json"
-    logging.info(f"[LEVER] {slug}")
-
-    try:
-        async with session.get(url) as r:
-            data = await r.json()
-    except:
-        return []
-
-    jobs = []
-
-    for j in data:
-        title = j.get("text", "")
-        desc = j.get("description", "")
-        link = j.get("hostedUrl")
-
-        job = {
-            "company": slug,
-            "title": title,
-            "url": link,
-            "salary": extract_salary(desc),
-        }
-
-        valid, reason = is_valid(title, desc)
-
-        if not valid:
-            log_result(f"REJECT-{reason}", job)
-            continue
-
-        if not job["salary"]:
-            job["salary"] = await fetch_salary_from_page(session, link)
-
-        job["salary"] = job["salary"] or "Not specified"
-
-        log_result("ACCEPT", job)
-        jobs.append(job)
-
-    return jobs
-
-# =========================
-# HIMALAYAS (FIXED)
-# =========================
+# ---------------- HIMALAYAS ----------------
 
 async def fetch_himalayas(session):
-    base = "https://himalayas.app/jobs/countries/canada?q=ruby"
-    logging.info("[HIMALAYAS] start")
-
+    log("HIMALAYAS", "fetching")
     jobs = []
 
-    for page in range(1, 4):
-        url = base + f"&page={page}"
-        logging.info(f"[HIMALAYAS] page {page}")
+    base = "https://himalayas.app/jobs/countries/canada?q=ruby"
 
-        try:
-            async with session.get(url) as r:
-                html = await r.text()
-        except:
-            continue
+    html = await fetch(session, base)
+    if not html:
+        return jobs
 
-        matches = re.findall(
-            r'<a[^>]+href="(/companies/[^"]+/jobs/[^"]+)"[^>]*>(.*?)</a>',
-            html,
-            re.DOTALL
-        )
+    soup = BeautifulSoup(html, "html.parser")
 
-        for link, raw_title in matches:
-            title = re.sub("<.*?>", "", raw_title).strip()
-            title = re.sub(r"\s+", " ", title)
+    links = []
+    for a in soup.find_all("a", href=True):
+        href = a["href"]
+        if "/jobs/" in href:
+            full = urljoin("https://himalayas.app", href)
+            links.append(full)
 
-            full_url = urljoin("https://himalayas.app", link)
+    links = list(set(links))
+    log("HIMALAYAS", f"found {len(links)} links")
 
-            if full_url in CACHE:
-                continue
-            CACHE.add(full_url)
+    tasks = [fetch(session, u) for u in links[:30]]
+    pages = await asyncio.gather(*tasks)
 
-            job = {
-                "company": "himalayas",
-                "title": title,
-                "url": full_url,
-                "salary": "Not specified"
-            }
+    for i, html in enumerate(pages):
+        if html:
+            job = parse_job(html, links[i])
+            if job:
+                jobs.append(job)
 
-            valid, reason = is_valid(title, "")
-
-            if not valid:
-                log_result(f"REJECT-{reason}", job)
-                continue
-
-            log_result("ACCEPT", job)
-            jobs.append(job)
-
-    logging.info(f"[HIMALAYAS] total {len(jobs)}")
+    log("HIMALAYAS", f"accepted {len(jobs)}")
     return jobs
 
-# =========================
-# EMAIL
-# =========================
+# ---------------- GREENHOUSE ----------------
 
-def group_jobs(jobs):
-    g = defaultdict(list)
-    for j in jobs:
-        g[j["company"]].append(j)
-    return g
+GREENHOUSE_COMPANIES = [
+    "gitlab",
+    "coinbase",
+    "novoed",
+    "fleetio"
+]
 
-def format_email(grouped):
-    out = []
+async def fetch_greenhouse(session):
+    jobs = []
 
-    for company, jobs in grouped.items():
-        out.append(f"\n🏢 {company.upper()}")
+    for company in GREENHOUSE_COMPANIES:
+        url = f"https://boards-api.greenhouse.io/v1/boards/{company}/jobs"
+        log("GREENHOUSE", company)
 
-        for j in jobs:
-            out.append(
-                f"- {j['title']}\n"
-                f"  💰 {j['salary']}\n"
-                f"  🔗 {j['url']}\n"
-            )
+        data = await fetch(session, url)
+        if not data:
+            continue
 
-    return "\n".join(out)
+        data = json.loads(data)
 
-def send_email(body, count):
-    import smtplib
-    from email.mime.text import MIMEText
+        for job in data.get("jobs", []):
+            title = job.get("title", "")
+            location = job.get("location", {}).get("name", "")
 
-    sender = os.getenv("EMAIL_SENDER")
-    password = os.getenv("EMAIL_PASSWORD")
-    receiver = os.getenv("EMAIL_RECEIVER")
+            combined = f"{title} {location}"
 
-    msg = MIMEText(body)
-    msg["Subject"] = f"Ruby Jobs ({count})"
-    msg["From"] = sender
-    msg["To"] = receiver
+            valid_role, reason = is_valid_role(title)
+            if not valid_role:
+                log("REJECT", f"{title} [{reason}]")
+                continue
 
-    with smtplib.SMTP_SSL("smtp.gmail.com", 465) as s:
-        s.login(sender, password)
-        s.sendmail(sender, receiver, msg.as_string())
+            if not contains_ruby(title):
+                continue
 
-    logging.info(f"[EMAIL] Sent {count}")
+            if not is_valid_location(location):
+                continue
 
-# =========================
-# MAIN
-# =========================
+            jobs.append({
+                "title": title,
+                "company": company,
+                "link": job.get("absolute_url"),
+                "salary": "N/A"
+            })
+
+    log("GREENHOUSE", f"{len(jobs)} jobs")
+    return jobs
+
+# ---------------- MAIN ----------------
 
 async def main():
-    logging.info("[SYSTEM] Starting")
-
-    companies = load_companies()
+    log("SYSTEM", "Starting Job Engine")
 
     async with aiohttp.ClientSession() as session:
-        tasks = []
+        results = await asyncio.gather(
+            fetch_greenhouse(session),
+            fetch_himalayas(session)
+        )
 
-        for c in companies:
-            if c["platform"] == "greenhouse":
-                tasks.append(fetch_greenhouse(session, c["slug"]))
-            if c["platform"] == "lever":
-                tasks.append(fetch_lever(session, c["slug"]))
+    jobs = [j for group in results for j in group]
 
-        tasks.append(fetch_himalayas(session))
+    log("DONE", f"Total jobs: {len(jobs)}")
 
-        results = await asyncio.gather(*tasks)
+    # ---------------- GROUP BY COMPANY ----------------
+    grouped = {}
+    for j in jobs:
+        grouped.setdefault(j["company"], []).append(j)
 
-    jobs = [j for sub in results for j in sub]
+    # ---------------- EMAIL ----------------
+    body = f"🔥 Ruby Jobs ({datetime.now().strftime('%Y-%m-%d')})\n\n"
 
-    logging.info(f"[DONE] {len(jobs)} jobs")
+    for company, items in grouped.items():
+        body += f"=== {company.upper()} ===\n"
+        for j in items:
+            body += f"{j['title']}\n{j['salary']}\n{j['link']}\n\n"
 
-    companies = update_companies(companies, jobs)
-    save_companies(companies)
+    msg = MIMEText(body)
+    msg["Subject"] = "🔥 Ruby Jobs"
+    msg["From"] = EMAIL_SENDER
+    msg["To"] = EMAIL_RECEIVER
 
-    grouped = group_jobs(jobs)
-    email = format_email(grouped)
+    with smtplib.SMTP_SSL("smtp.gmail.com", 465) as s:
+        s.login(EMAIL_SENDER, EMAIL_PASSWORD)
+        s.send_message(msg)
 
-    send_email(email, len(jobs))
+    log("EMAIL", f"Sent {len(jobs)} jobs")
 
 if __name__ == "__main__":
     asyncio.run(main())
