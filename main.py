@@ -22,13 +22,27 @@ logging.basicConfig(
 
 COMPANIES_FILE = "companies.json"
 
-INCLUDE_TITLE = ["engineer", "developer"]
-MUST_HAVE_SENIOR = ["senior", "sr"]
+INCLUDE_KEYWORDS = [
+    "engineer",
+    "developer",
+    "backend",
+    "back end",
+    "back-end",
+    "software",
+    "rails"
+]
 
-EXCLUDE = [
-    "staff", "principal", "vp", "director",
-    "head", "lead", "manager", "architect",
-    "intern", "junior"
+EXCLUDE_KEYWORDS = [
+    "staff",
+    "principal",
+    "vp",
+    "director",
+    "head",
+    "lead",
+    "manager",
+    "architect",
+    "intern",
+    "junior"
 ]
 
 CANADA_KEYWORDS = ["canada", "remote", "ca"]
@@ -48,24 +62,33 @@ def save_companies(c):
     json.dump(c, open(COMPANIES_FILE, "w"), indent=2)
 
 # =========================
-# SALARY (FIXED PROPERLY)
+# NORMALIZATION (FIX)
+# =========================
+
+def normalize(text):
+    text = text.lower()
+    text = text.replace("-", " ")
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
+
+# =========================
+# SALARY (ROBUST)
 # =========================
 
 def extract_salary(text):
     if not text:
         return None
 
-    # normalize unicode dashes
     t = text.replace("—", "-").replace("–", "-").replace(",", "")
 
     patterns = [
         r"\$\d{5,6}\s*-\s*\$\d{5,6}",
         r"\$\d{2,3}k\s*-\s*\$\d{2,3}k",
-        r"\$\d{5,6}",
+        r"\$\d{5,6}"
     ]
 
     for p in patterns:
-        m = re.search(p, t)
+        m = re.search(p, t, re.IGNORECASE)
         if m:
             return m.group(0)
 
@@ -80,22 +103,22 @@ async def fetch_salary_from_page(session, url):
         return None
 
 # =========================
-# FILTERING
+# FILTERING (FIXED)
 # =========================
 
 def is_valid(title, text):
-    t = title.lower()
+    raw = title
+    title = normalize(title)
 
-    if not any(k in t for k in INCLUDE_TITLE):
+    # Must be some kind of engineer/dev
+    if not any(k in title for k in INCLUDE_KEYWORDS):
         return False, "NOT_ENGINEER"
 
-    if not any(k in t for k in MUST_HAVE_SENIOR):
-        return False, "NOT_SENIOR"
-
-    if any(k in t for k in EXCLUDE):
+    # Reject only clearly unwanted roles
+    if any(k in title for k in EXCLUDE_KEYWORDS):
         return False, "EXCLUDED_ROLE"
 
-    full = (title + " " + text).lower()
+    full = normalize(title + " " + text)
 
     if not any(k in full for k in CANADA_KEYWORDS):
         return False, "NOT_CANADA"
@@ -116,16 +139,12 @@ def detect_company(url):
 
         if "greenhouse" in domain:
             return {"platform": "greenhouse", "slug": path[0]}
-
         if "lever" in domain:
             return {"platform": "lever", "slug": path[0]}
-
         if "ashby" in domain:
             return {"platform": "ashby", "slug": path[0]}
-
         if "workable" in domain:
             return {"platform": "workable", "slug": path[0]}
-
     except:
         pass
 
@@ -240,7 +259,7 @@ async def fetch_lever(session, slug):
     return jobs
 
 # =========================
-# HIMALAYAS (CANADA FIX)
+# HIMALAYAS (FIXED)
 # =========================
 
 async def fetch_himalayas(session):
@@ -249,7 +268,7 @@ async def fetch_himalayas(session):
 
     jobs = []
 
-    for page in range(1, 4):  # paginate
+    for page in range(1, 4):
         url = base + f"&page={page}"
         logging.info(f"[HIMALAYAS] page {page}")
 
@@ -267,6 +286,8 @@ async def fetch_himalayas(session):
 
         for link, raw_title in matches:
             title = re.sub("<.*?>", "", raw_title).strip()
+            title = re.sub(r"\s+", " ", title)
+
             full_url = urljoin("https://himalayas.app", link)
 
             if full_url in CACHE:
@@ -326,7 +347,7 @@ def send_email(body, count):
     receiver = os.getenv("EMAIL_RECEIVER")
 
     msg = MIMEText(body)
-    msg["Subject"] = f"Senior Ruby Jobs ({count})"
+    msg["Subject"] = f"Ruby Jobs ({count})"
     msg["From"] = sender
     msg["To"] = receiver
 
