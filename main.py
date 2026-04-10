@@ -40,7 +40,7 @@ INCLUDE = [
 EXCLUDE = [
     "staff", "principal", "distinguished", "architect",
     "head of", "director", "vp", "vice president",
-    "lead (senior)", "sr. staff", "staff engineer"
+    "lead", "sr. staff", "staff engineer"
 ]
 
 def is_relevant(text: str) -> bool:
