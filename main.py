@@ -43,16 +43,10 @@ def contains_ruby(text):
     return any(k in text.lower() for k in RUBY_KEYWORDS)
 
 def is_engineering_role(text):
-    t = text.lower()
-    return any(k in t for k in GOOD_ROLE_KEYWORDS)
+    return any(k in text.lower() for k in GOOD_ROLE_KEYWORDS)
 
 def is_excluded_level(text):
-    t = text.lower()
-    return any(k in t for k in EXCLUDE_LEVELS)
-
-def is_allowed_level(text):
-    t = text.lower()
-    return any(k in t for k in ALLOWED_LEVELS)
+    return any(k in text.lower() for k in EXCLUDE_LEVELS)
 
 def is_valid_role(title):
     t = title.lower()
@@ -63,21 +57,16 @@ def is_valid_role(title):
     if is_excluded_level(t):
         return False, "EXCLUDED_LEVEL"
 
-    # allow senior OR intermediate OR unspecified
     return True, "VALID"
 
 def is_valid_location(text):
     t = text.lower()
-
-    if any(x in t for x in ["canada", "north america", "worldwide", "anywhere"]):
-        return True
-
-    return False
+    return any(x in t for x in ["canada", "north america", "worldwide", "anywhere"])
 
 def extract_salary(text):
     patterns = [
         r"\$[\d,]{2,3}(?:,\d{3})*(?:\s*[-—–]\s*\$?[\d,]{2,3}(?:,\d{3})*)?",
-        r"[\d,]{2,3}(?:,\d{3})*\s*(?:usd|cad)",
+        r"[\d,]{2,3}(?:,\d{3})*\s*(?:usd|cad)"
     ]
 
     for p in patterns:
@@ -91,6 +80,7 @@ def extract_salary(text):
 
 async def fetch(session, url):
     try:
+        log("FETCH", url)
         async with session.get(url, timeout=20) as resp:
             if resp.status != 200:
                 log("HTTP", f"{resp.status} {url}")
@@ -113,15 +103,12 @@ def parse_job(html, url):
         title = soup.title.string if soup.title else ""
 
     text = soup.get_text(" ", strip=True)
-
     company = urlparse(url).netloc
     salary = extract_salary(text)
 
     log("PARSE", f"{url}")
     log("PARSE", f"Title: {title}")
     log("PARSE", f"Salary: {salary}")
-
-    # ---------------- FILTERS ----------------
 
     valid_role, reason = is_valid_role(title)
     if not valid_role:
@@ -136,8 +123,7 @@ def parse_job(html, url):
         log("REJECT", f"{url} [NOT_CANADA]")
         return None
 
-    log("ACCEPT", f"{title}")
-
+    log("ACCEPT", f"{url}")
     return {
         "title": title,
         "company": company,
@@ -148,86 +134,50 @@ def parse_job(html, url):
 # ---------------- HIMALAYAS ----------------
 
 async def fetch_himalayas(session):
-    log("HIMALAYAS", "fetching")
+    log("HIMALAYAS", "Starting Canada Ruby search")
+
+    base_url = "https://himalayas.app/jobs/countries/canada?q=ruby"
     jobs = []
 
-    base = "https://himalayas.app/jobs/countries/canada?q=ruby"
-
-    html = await fetch(session, base)
+    html = await fetch(session, base_url)
     if not html:
+        log("HIMALAYAS", "Failed to load search page")
         return jobs
 
     soup = BeautifulSoup(html, "html.parser")
 
-    links = []
+    job_links = set()
+
+    # STRICT: only grab actual job links
     for a in soup.find_all("a", href=True):
         href = a["href"]
-        if "/jobs/" in href:
-            full = urljoin("https://himalayas.app", href)
-            links.append(full)
 
-    links = list(set(links))
-    log("HIMALAYAS", f"found {len(links)} links")
+        # Only valid job pages
+        if "/companies/" in href and "/jobs/" in href:
+            full_url = urljoin("https://himalayas.app", href)
+            job_links.add(full_url)
 
-    tasks = [fetch(session, u) for u in links[:30]]
+    log("HIMALAYAS", f"Found {len(job_links)} job links")
+
+    # DEBUG: log all discovered URLs
+    for url in job_links:
+        log("HIMALAYAS-LINK", url)
+
+    tasks = [fetch(session, url) for url in list(job_links)[:50]]
     pages = await asyncio.gather(*tasks)
 
     for i, html in enumerate(pages):
-        if html:
-            job = parse_job(html, links[i])
-            if job:
-                jobs.append(job)
+        url = list(job_links)[i]
 
-    log("HIMALAYAS", f"accepted {len(jobs)}")
-    return jobs
-
-# ---------------- GREENHOUSE ----------------
-
-GREENHOUSE_COMPANIES = [
-    "gitlab",
-    "coinbase",
-    "novoed",
-    "fleetio"
-]
-
-async def fetch_greenhouse(session):
-    jobs = []
-
-    for company in GREENHOUSE_COMPANIES:
-        url = f"https://boards-api.greenhouse.io/v1/boards/{company}/jobs"
-        log("GREENHOUSE", company)
-
-        data = await fetch(session, url)
-        if not data:
+        if not html:
+            log("REJECT", f"{url} [NO_HTML]")
             continue
 
-        data = json.loads(data)
+        job = parse_job(html, url)
+        if job:
+            jobs.append(job)
 
-        for job in data.get("jobs", []):
-            title = job.get("title", "")
-            location = job.get("location", {}).get("name", "")
-
-            combined = f"{title} {location}"
-
-            valid_role, reason = is_valid_role(title)
-            if not valid_role:
-                log("REJECT", f"{title} [{reason}]")
-                continue
-
-            if not contains_ruby(title):
-                continue
-
-            if not is_valid_location(location):
-                continue
-
-            jobs.append({
-                "title": title,
-                "company": company,
-                "link": job.get("absolute_url"),
-                "salary": "N/A"
-            })
-
-    log("GREENHOUSE", f"{len(jobs)} jobs")
+    log("HIMALAYAS", f"Accepted {len(jobs)} jobs")
     return jobs
 
 # ---------------- MAIN ----------------
@@ -236,16 +186,13 @@ async def main():
     log("SYSTEM", "Starting Job Engine")
 
     async with aiohttp.ClientSession() as session:
-        results = await asyncio.gather(
-            fetch_greenhouse(session),
-            fetch_himalayas(session)
-        )
+        himalayas_jobs = await fetch_himalayas(session)
 
-    jobs = [j for group in results for j in group]
+    jobs = himalayas_jobs
 
     log("DONE", f"Total jobs: {len(jobs)}")
 
-    # ---------------- GROUP BY COMPANY ----------------
+    # ---------------- GROUP ----------------
     grouped = {}
     for j in jobs:
         grouped.setdefault(j["company"], []).append(j)
@@ -256,7 +203,7 @@ async def main():
     for company, items in grouped.items():
         body += f"=== {company.upper()} ===\n"
         for j in items:
-            body += f"{j['title']}\n{j['salary']}\n{j['link']}\n\n"
+            body += f"{j['title']}\nSalary: {j['salary']}\n{j['link']}\n\n"
 
     msg = MIMEText(body)
     msg["Subject"] = "🔥 Ruby Jobs"
@@ -268,6 +215,7 @@ async def main():
         s.send_message(msg)
 
     log("EMAIL", f"Sent {len(jobs)} jobs")
+    log("SYSTEM", "Complete")
 
 if __name__ == "__main__":
     asyncio.run(main())
