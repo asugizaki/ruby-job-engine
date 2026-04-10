@@ -1,41 +1,6 @@
-[
-  {
-    "name": "GitLab",
-    "platform": "greenhouse",
-    "slug": "gitlab"
-  },
-  {
-    "name": "Coinbase",
-    "platform": "greenhouse",
-    "slug": "coinbase"
-  },
-  {
-    "name": "Shopify",
-    "platform": "greenhouse",
-    "slug": "shopify"
-  },
-  {
-    "platform": "remotive",
-    "slug": "KnownHost"
-  },
-  {
-    "platform": "remotive",
-    "slug": "Mitre Media"
-  },
-  {
-    "platform": "remoteok",
-    "slug": "Versapay"
-  },
-  {
-    "platform": "remoteok",
-    "slug": "Perforce"
-  },
-  {
-    "platform": "greenhouse",
-    "slug": "novoed"
-  },
-  {
-    "platform": "greenhouse",
-    "slug": "fleetio"
-  }
-]
+{
+  "greenhouse": [],
+  "lever": [],
+  "ashby": [],
+  "workable": []
+}
