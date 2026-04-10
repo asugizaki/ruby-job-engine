@@ -1,5 +1,21 @@
 [
-  { "name": "GitLab", "platform": "greenhouse", "slug": "gitlab" },
-  { "name": "Coinbase", "platform": "greenhouse", "slug": "coinbase" },
-  { "name": "Shopify", "platform": "greenhouse", "slug": "shopify" }
+  {
+    "name": "GitLab",
+    "platform": "greenhouse",
+    "slug": "gitlab"
+  },
+  {
+    "name": "Coinbase",
+    "platform": "greenhouse",
+    "slug": "coinbase"
+  },
+  {
+    "name": "Shopify",
+    "platform": "greenhouse",
+    "slug": "shopify"
+  },
+  {
+    "platform": "remotive",
+    "slug": "KnownHost"
+  }
 ]
