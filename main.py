@@ -5,7 +5,6 @@ import logging
 import os
 import smtplib
 from email.mime.text import MIMEText
-from datetime import datetime
 
 # =========================
 # CONFIG
@@ -16,36 +15,29 @@ OUTPUT_FILE = "output_jobs.json"
 
 KEYWORDS = ["ruby", "rails", "ruby on rails", "ror", "backend"]
 
-REMOTE_BOARD_SOURCES = [
-    "https://remotive.com/api/remote-jobs",
-    "https://remoteok.com/remote-ruby-jobs.json"
-]
-
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s"
 )
 
 # =========================
-# EMAIL CONFIG
+# EMAIL (YOUR ORIGINAL SECRETS)
 # =========================
 
 EMAIL_ENABLED = all([
-    os.getenv("EMAIL_HOST"),
-    os.getenv("EMAIL_USER"),
-    os.getenv("EMAIL_PASS"),
-    os.getenv("EMAIL_TO")
+    os.getenv("EMAIL_SENDER"),
+    os.getenv("EMAIL_RECEIVER"),
+    os.getenv("EMAIL_PASSWORD")
 ])
 
-EMAIL_HOST = os.getenv("EMAIL_HOST")
-EMAIL_USER = os.getenv("EMAIL_USER")
-EMAIL_PASS = os.getenv("EMAIL_PASS")
-EMAIL_TO = os.getenv("EMAIL_TO")
+EMAIL_SENDER = os.getenv("EMAIL_SENDER")
+EMAIL_RECEIVER = os.getenv("EMAIL_RECEIVER")
+EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD")
 
 
 def send_email(jobs):
     if not EMAIL_ENABLED:
-        logging.warning("[EMAIL] Missing env vars, skipping email")
+        logging.warning("[EMAIL] Missing secrets, skipping email")
         return
 
     if not jobs:
@@ -54,17 +46,17 @@ def send_email(jobs):
 
     body = "\n\n".join([
         f"{j['title']} ({j['company']})\n{j['url']}"
-        for j in jobs
+        for j in jobs[:50]
     ])
 
     msg = MIMEText(body)
     msg["Subject"] = f"New Ruby Jobs Found ({len(jobs)})"
-    msg["From"] = EMAIL_USER
-    msg["To"] = EMAIL_TO
+    msg["From"] = EMAIL_SENDER
+    msg["To"] = EMAIL_RECEIVER
 
     try:
-        with smtplib.SMTP_SSL(EMAIL_HOST, 465) as server:
-            server.login(EMAIL_USER, EMAIL_PASS)
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
+            server.login(EMAIL_SENDER, EMAIL_PASSWORD)
             server.send_message(msg)
 
         logging.info(f"[EMAIL] Sent {len(jobs)} jobs")
@@ -91,7 +83,7 @@ def is_relevant(text):
     text = text.lower()
     return any(k in text for k in KEYWORDS)
 
-def make_id(company, title):
+def job_id(company, title):
     return f"{company}-{title}".lower()
 
 
@@ -125,7 +117,9 @@ async def greenhouse(session, slug):
 
     jobs = []
     for j in data.get("jobs", []):
-        if is_relevant(j.get("title", "") + j.get("content", "")):
+        text = j.get("title", "") + j.get("content", "")
+
+        if is_relevant(text):
             jobs.append({
                 "company": slug,
                 "title": j.get("title"),
@@ -147,7 +141,9 @@ async def lever(session, slug):
 
     jobs = []
     for j in data:
-        if is_relevant(j.get("text", "") + j.get("descriptionPlain", "")):
+        text = j.get("text", "") + j.get("descriptionPlain", "")
+
+        if is_relevant(text):
             jobs.append({
                 "company": slug,
                 "title": j.get("text"),
@@ -169,7 +165,9 @@ async def workable(session, slug):
 
     jobs = []
     for j in data.get("results", []):
-        if is_relevant(j.get("title", "") + j.get("description", "")):
+        text = j.get("title", "") + j.get("description", "")
+
+        if is_relevant(text):
             jobs.append({
                 "company": slug,
                 "title": j.get("title"),
@@ -182,7 +180,7 @@ async def workable(session, slug):
 
 
 # =========================
-# REMOTE JOB BOARDS (RESTORED)
+# JOB BOARDS (RESTORED)
 # =========================
 
 async def remotive(session):
@@ -195,7 +193,9 @@ async def remotive(session):
 
     jobs = []
     for j in data.get("jobs", []):
-        if is_relevant(j.get("title", "") + j.get("description", "")):
+        text = j.get("title", "") + j.get("description", "")
+
+        if is_relevant(text):
             jobs.append({
                 "company": j.get("company_name"),
                 "title": j.get("title"),
@@ -217,15 +217,42 @@ async def remoteok(session):
 
     jobs = []
     for j in data:
-        if isinstance(j, dict) and is_relevant(j.get("position", "") + j.get("description", "")):
-            jobs.append({
-                "company": j.get("company"),
-                "title": j.get("position"),
-                "url": j.get("url"),
-                "source": "remoteok"
-            })
+        if isinstance(j, dict):
+            text = j.get("position", "") + j.get("description", "")
+
+            if is_relevant(text):
+                jobs.append({
+                    "company": j.get("company"),
+                    "title": j.get("position"),
+                    "url": j.get("url"),
+                    "source": "remoteok"
+                })
 
     logging.info(f"[REMOTEOK] -> {len(jobs)}")
+    return jobs
+
+
+async def himalayas(session):
+    url = "https://himalayas.app/jobs/api?query=ruby"
+    logging.info("[HIMALAYAS] fetching")
+
+    data = await fetch_json(session, url)
+    if not data:
+        return []
+
+    jobs = []
+    for j in data.get("jobs", []):
+        text = j.get("title", "") + j.get("description", "")
+
+        if is_relevant(text):
+            jobs.append({
+                "company": j.get("company"),
+                "title": j.get("title"),
+                "url": j.get("url"),
+                "source": "himalayas"
+            })
+
+    logging.info(f"[HIMALAYAS] -> {len(jobs)}")
     return jobs
 
 
@@ -267,25 +294,24 @@ async def main():
 
     async with aiohttp.ClientSession() as session:
 
-        # ATS sources
         company_tasks = [fetch_company(session, c) for c in companies]
 
-        # job boards (RESTORED)
         board_tasks = [
             remotive(session),
-            remoteok(session)
+            remoteok(session),
+            himalayas(session)
         ]
 
         results = await asyncio.gather(*(company_tasks + board_tasks))
 
         for group in results:
             for job in group:
-                job_id = make_id(job["company"], job["title"])
+                jid = job_id(job["company"], job["title"])
 
-                if job_id in seen:
+                if jid in seen:
                     continue
 
-                seen.add(job_id)
+                seen.add(jid)
                 all_jobs.append(job)
 
     logging.info(f"[DONE] Total jobs: {len(all_jobs)}")
