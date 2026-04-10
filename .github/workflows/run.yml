@@ -2,8 +2,11 @@ name: Ruby Job Engine
 
 on:
   schedule:
-    - cron: "0 14 * * *"  # once per day (UTC)
+    - cron: "0 14 * * *"
   workflow_dispatch:
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
   run-script:
