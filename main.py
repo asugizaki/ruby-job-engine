@@ -1,5 +1,5 @@
-# ELITE RUBY JOB INTELLIGENCE SYSTEM (FINAL PRODUCTION)
-# ----------------------------------------------------
+# ELITE RUBY JOB INTELLIGENCE SYSTEM (HIMALAYAS + RUBYONREMOTE)
+# ------------------------------------------------------------
 
 import asyncio
 import aiohttp
@@ -31,15 +31,14 @@ COMPANY_STORE_FILE = "companies.json"
 
 RUBY_KEYWORDS = ["ruby", "rails"]
 
-# roles we WANT
 ENGINEER_KEYWORDS = [
     "engineer", "developer", "backend", "full stack",
     "software engineer", "software developer"
 ]
 
-# roles we DON'T want
 EXCLUDE_KEYWORDS = [
-    "staff", "principal", "lead", "manager", "director", "vp", "head", "architect"
+    "staff", "principal", "lead", "manager",
+    "director", "vp", "head", "architect"
 ]
 
 # ---------------- HELPERS ----------------
@@ -64,7 +63,7 @@ def is_canada_friendly(text):
     if "canada" in t:
         return True
 
-    if "remote" in t and not any(x in t for x in ["india", "philippines", "latam", "europe only"]):
+    if "remote" in t and not any(x in t for x in ["india", "philippines", "latam"]):
         return True
 
     return False
@@ -74,15 +73,15 @@ def extract_salary(text):
         return None
 
     patterns = [
-        r"\$\d{2,3}[,]?\d{3}\s*[–-]\s*\$\d{2,3}[,]?\d{3}",
-        r"\$\d{2,3}[kK]\s*[–-]\s*\$\d{2,3}[kK]",
+        r"\$\d{2,3}[,]?\d{3}\s*[–—-]\s*\$\d{2,3}[,]?\d{3}",
+        r"\$\d{2,3}[kK]\s*[–—-]\s*\$\d{2,3}[kK]",
         r"\$\d{2,3}[,]?\d{3}"
     ]
 
     for p in patterns:
-        match = re.search(p, text)
-        if match:
-            return match.group(0)
+        m = re.search(p, text)
+        if m:
+            return m.group(0)
 
     return None
 
@@ -146,7 +145,7 @@ async def fetch(session, url):
 # ---------------- HIMALAYAS ----------------
 
 async def fetch_himalayas(session):
-    log("HIMALAYAS", "Fetching Canada Ruby jobs")
+    log("HIMALAYAS", "Fetching")
 
     url = "https://himalayas.app/jobs/countries/canada?q=ruby"
     html = await fetch(session, url)
@@ -157,26 +156,51 @@ async def fetch_himalayas(session):
     soup = BeautifulSoup(html, "html.parser")
 
     links = []
-
     for a in soup.find_all("a", href=True):
-        href = a["href"]
-
-        if "/jobs/" in href:
-            full = urljoin(url, href)
-            links.append(full)
+        if "/jobs/" in a["href"]:
+            links.append(urljoin(url, a["href"]))
 
     links = list(set(links))
     log("HIMALAYAS", f"Found {len(links)} links")
 
-    jobs = []
     tasks = [process_job(session, u) for u in links[:30]]
     results = await asyncio.gather(*tasks)
 
-    for r in results:
-        if r:
-            jobs.append(r)
-
+    jobs = [r for r in results if r]
     log("HIMALAYAS", f"Valid jobs: {len(jobs)}")
+
+    return jobs
+
+# ---------------- RUBYONREMOTE ----------------
+
+async def fetch_rubyonremote(session):
+    log("RUBYONREMOTE", "Fetching Canada page")
+
+    url = "https://rubyonremote.com/remote-jobs-in-canada/"
+    html = await fetch(session, url)
+
+    if not html:
+        return []
+
+    soup = BeautifulSoup(html, "html.parser")
+
+    links = []
+    for a in soup.find_all("a", href=True):
+        href = a["href"]
+
+        # filter actual job links
+        if "/jobs/" in href or "/companies/" in href:
+            links.append(urljoin(url, href))
+
+    links = list(set(links))
+    log("RUBYONREMOTE", f"Found {len(links)} links")
+
+    tasks = [process_job(session, u) for u in links[:30]]
+    results = await asyncio.gather(*tasks)
+
+    jobs = [r for r in results if r]
+    log("RUBYONREMOTE", f"Valid jobs: {len(jobs)}")
+
     return jobs
 
 # ---------------- JOB PROCESSING ----------------
@@ -189,8 +213,8 @@ async def process_job(session, url):
 
     soup = BeautifulSoup(html, "html.parser")
 
-    title = soup.find("h1")
-    title = title.get_text(strip=True) if title else "Unknown"
+    title_tag = soup.find("h1")
+    title = title_tag.get_text(strip=True) if title_tag else "Unknown"
 
     body = soup.get_text(" ", strip=True)
 
@@ -229,8 +253,9 @@ async def main():
 
     async with aiohttp.ClientSession() as session:
         jobs += await fetch_himalayas(session)
+        jobs += await fetch_rubyonremote(session)
 
-    # DISCOVER COMPANIES
+    # COMPANY DISCOVERY
     for j in jobs:
         discover_company(j["link"], store)
 
@@ -241,7 +266,7 @@ async def main():
     for j in jobs:
         grouped.setdefault(j["company"], []).append(j)
 
-    # EMAIL FORMAT
+    # EMAIL
     body = f"🔥 RUBY JOBS - {datetime.now().strftime('%Y-%m-%d')}\n\n"
 
     for company, js in grouped.items():
