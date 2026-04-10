@@ -20,7 +20,7 @@ logging.basicConfig(
 )
 
 # =========================
-# EMAIL (UNCHANGED SECRETS)
+# EMAIL (GitHub Secrets)
 # =========================
 
 EMAIL_SENDER = os.getenv("EMAIL_SENDER")
@@ -30,18 +30,8 @@ EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD")
 EMAIL_ENABLED = all([EMAIL_SENDER, EMAIL_RECEIVER, EMAIL_PASSWORD])
 
 # =========================
-# FILTERING (FIXED)
+# FILTER (SENIOR ONLY)
 # =========================
-
-INCLUDE = [
-    "ruby", "rails", "ruby on rails", "ror", "backend"
-]
-
-EXCLUDE = [
-    "staff", "principal", "distinguished", "architect",
-    "head of", "director", "vp", "vice president",
-    "lead", "sr. staff", "staff engineer"
-]
 
 def is_relevant(text: str) -> bool:
     if not text:
@@ -49,32 +39,59 @@ def is_relevant(text: str) -> bool:
 
     t = text.lower()
 
-    if not any(k in t for k in INCLUDE):
+    # MUST be Ruby related
+    if not any(k in t for k in ["ruby", "rails", "ruby on rails", "ror"]):
         return False
 
-    if any(e in t for e in EXCLUDE):
+    # MUST be senior level
+    senior_signals = [
+        "senior", "sr", "software engineer ii", "engineer ii"
+    ]
+
+    if not any(s in t for s in senior_signals):
+        return False
+
+    # EXCLUDE non-senior / leadership noise
+    excludes = [
+        "junior", "jr", "entry", "graduate",
+        "staff", "principal", "distinguished",
+        "vp", "vice president", "director", "head of",
+        "intern"
+    ]
+
+    if any(x in t for x in excludes):
         return False
 
     return True
 
 
 # =========================
-# SALARY EXTRACTION (NEW)
+# SALARY EXTRACTION
 # =========================
 
-salary_pattern = re.compile(
-    r"(\$?\d{2,3}[kK]?\s?[-–]\s?\$?\d{2,3}[kK]?)"
-)
+salary_pattern = re.compile(r"(\$?\d{2,3}[kK]?\s?[-–]\s?\$?\d{2,3}[kK]?)")
 
 def extract_salary(text: str):
     if not text:
-        return None
-    match = salary_pattern.search(text)
-    return match.group(1) if match else "Not specified"
+        return "Not specified"
+    m = salary_pattern.search(text)
+    return m.group(1) if m else "Not specified"
 
 
 # =========================
-# COMPANIES (DYNAMIC FIX)
+# SENIORITY TAG
+# =========================
+
+def detect_seniority(text: str):
+    t = text.lower()
+
+    if "software engineer ii" in t or "engineer ii" in t:
+        return "Senior (II)"
+    return "Senior"
+
+
+# =========================
+# COMPANIES (DYNAMIC)
 # =========================
 
 def load_companies():
@@ -89,49 +106,8 @@ def save_companies(companies):
 
 def add_company(companies, new):
     if not any(c["slug"] == new["slug"] and c["platform"] == new["platform"] for c in companies):
-        logging.info(f"[NEW COMPANY DISCOVERED] {new}")
+        logging.info(f"[NEW COMPANY] {new}")
         companies.append(new)
-
-
-# =========================
-# EMAIL FORMAT (NEW GROUPING)
-# =========================
-
-def send_email(jobs):
-    if not EMAIL_ENABLED:
-        logging.warning("[EMAIL] Missing credentials")
-        return
-
-    if not jobs:
-        return
-
-    grouped = {}
-
-    for j in jobs:
-        grouped.setdefault(j["company"], []).append(j)
-
-    lines = []
-
-    for company, items in grouped.items():
-        lines.append(f"\n=== {company.upper()} ===\n")
-
-        for j in items:
-            lines.append(
-                f"- {j['title']} | {j['salary']} | {j['url']}"
-            )
-
-    body = "\n".join(lines)
-
-    msg = MIMEText(body)
-    msg["Subject"] = f"Ruby Jobs ({len(jobs)})"
-    msg["From"] = EMAIL_SENDER
-    msg["To"] = EMAIL_RECEIVER
-
-    with smtplib.SMTP_SSL("smtp.gmail.com", 465) as s:
-        s.login(EMAIL_SENDER, EMAIL_PASSWORD)
-        s.send_message(msg)
-
-    logging.info(f"[EMAIL] Sent grouped jobs: {len(jobs)}")
 
 
 # =========================
@@ -151,31 +127,20 @@ async def fetch_json(session, url):
 
 
 # =========================
-# GREENHOUSE (FIXED SHOPIFY)
+# GREENHOUSE
 # =========================
 
 async def greenhouse(session, slug):
-    urls_to_try = [
-        f"https://boards-api.greenhouse.io/v1/boards/{slug}/jobs",
-        f"https://boards-api.greenhouse.io/v1/boards/{slug}-inc/jobs",
-        f"https://boards-api.greenhouse.io/v1/boards/{slug}inc/jobs",
-    ]
+    url = f"https://boards-api.greenhouse.io/v1/boards/{slug}/jobs"
+    logging.info(f"[GREENHOUSE] {slug}")
 
-    data = None
-
-    for url in urls_to_try:
-        logging.info(f"[GREENHOUSE TRY] {url}")
-        data = await fetch_json(session, url)
-        if data:
-            break
-
+    data = await fetch_json(session, url)
     if not data:
-        logging.warning(f"[GREENHOUSE FAILED] {slug}")
         return []
 
     jobs = []
     for j in data.get("jobs", []):
-        text = j.get("title", "") + j.get("content", "")
+        text = (j.get("title", "") or "") + (j.get("content", "") or "")
 
         if is_relevant(text):
             jobs.append({
@@ -183,23 +148,27 @@ async def greenhouse(session, slug):
                 "title": j.get("title"),
                 "url": j.get("absolute_url"),
                 "salary": extract_salary(text),
+                "seniority": detect_seniority(text),
                 "source": "greenhouse"
             })
 
+    logging.info(f"[GREENHOUSE] {slug} -> {len(jobs)}")
     return jobs
 
 
 # =========================
-# LEVER / WORKABLE (UNCHANGED CORE)
+# LEVER
 # =========================
 
 async def lever(session, slug):
     url = f"https://api.lever.co/v0/postings/{slug}?mode=json"
+    logging.info(f"[LEVER] {slug}")
+
     data = await fetch_json(session, url) or []
 
     jobs = []
     for j in data:
-        text = j.get("text", "") + j.get("descriptionPlain", "")
+        text = (j.get("text", "") or "") + (j.get("descriptionPlain", "") or "")
 
         if is_relevant(text):
             jobs.append({
@@ -207,6 +176,7 @@ async def lever(session, slug):
                 "title": j.get("text"),
                 "url": j.get("hostedUrl"),
                 "salary": extract_salary(text),
+                "seniority": detect_seniority(text),
                 "source": "lever"
             })
 
@@ -220,6 +190,8 @@ async def lever(session, slug):
 
 async def remotive(session):
     url = "https://remotive.com/api/remote-jobs"
+    logging.info("[REMOTIVE] fetching")
+
     data = await fetch_json(session, url) or {}
 
     jobs = []
@@ -232,23 +204,90 @@ async def remotive(session):
                 "title": j.get("title"),
                 "url": j.get("url"),
                 "salary": "Not specified",
+                "seniority": "Senior",
                 "source": "remotive"
             })
 
+    logging.info(f"[REMOTIVE] -> {len(jobs)}")
+    return jobs
+
+
+async def remoteok(session):
+    url = "https://remoteok.com/remote-ruby-jobs.json"
+    logging.info("[REMOTEOK] fetching")
+
+    data = await fetch_json(session, url) or []
+
+    jobs = []
+    for j in data:
+        if isinstance(j, dict):
+            text = j.get("position", "") + j.get("description", "")
+
+            if is_relevant(text):
+                jobs.append({
+                    "company": j.get("company"),
+                    "title": j.get("position"),
+                    "url": j.get("url"),
+                    "salary": "Not specified",
+                    "seniority": detect_seniority(text),
+                    "source": "remoteok"
+                })
+
+    logging.info(f"[REMOTEOK] -> {len(jobs)}")
     return jobs
 
 
 # =========================
-# MAIN ENGINE (AUTO DISCOVERY)
+# EMAIL
+# =========================
+
+def send_email(jobs):
+    if not EMAIL_ENABLED:
+        logging.warning("[EMAIL] Missing credentials")
+        return
+
+    if not jobs:
+        return
+
+    grouped = {}
+
+    for j in jobs:
+        grouped.setdefault(j["company"], []).append(j)
+
+    lines = []
+
+    for company, items in grouped.items():
+        lines.append(f"\n================ {company.upper()} ================\n")
+
+        for j in items:
+            lines.append(
+                f"[{j['seniority']}] {j['title']} | {j['salary']} | {j['url']}"
+            )
+
+    body = "\n".join(lines)
+
+    msg = MIMEText(body)
+    msg["Subject"] = f"Senior Ruby Jobs ({len(jobs)})"
+    msg["From"] = EMAIL_SENDER
+    msg["To"] = EMAIL_RECEIVER
+
+    with smtplib.SMTP_SSL("smtp.gmail.com", 465) as s:
+        s.login(EMAIL_SENDER, EMAIL_PASSWORD)
+        s.send_message(msg)
+
+    logging.info(f"[EMAIL] Sent {len(jobs)} jobs")
+
+
+# =========================
+# MAIN
 # =========================
 
 async def main():
     logging.info("[SYSTEM] Starting Job Engine")
 
     companies = load_companies()
-    discovered = []
-
     all_jobs = []
+    discovered = []
 
     async with aiohttp.ClientSession() as session:
 
@@ -257,18 +296,17 @@ async def main():
         for c in companies:
             if c["platform"] == "greenhouse":
                 tasks.append(greenhouse(session, c["slug"]))
-            if c["platform"] == "lever":
+            elif c["platform"] == "lever":
                 tasks.append(lever(session, c["slug"]))
 
         tasks.append(remotive(session))
+        tasks.append(remoteok(session))
 
         results = await asyncio.gather(*tasks)
 
         for group in results:
             for job in group:
                 all_jobs.append(job)
-
-                # AUTO DISCOVERY
                 discovered.append({
                     "platform": job.get("source", "unknown"),
                     "slug": job["company"]
@@ -278,7 +316,7 @@ async def main():
     with open(OUTPUT_FILE, "w") as f:
         json.dump(all_jobs, f, indent=2)
 
-    # update companies dynamically
+    # auto-update companies
     for c in discovered:
         add_company(companies, c)
 
@@ -286,7 +324,7 @@ async def main():
 
     send_email(all_jobs)
 
-    logging.info(f"[DONE] Jobs: {len(all_jobs)} | Companies updated: {len(companies)}")
+    logging.info(f"[DONE] {len(all_jobs)} senior Ruby jobs")
 
 
 if __name__ == "__main__":
