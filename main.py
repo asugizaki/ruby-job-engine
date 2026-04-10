@@ -1,17 +1,5 @@
-# ELITE RUBY JOB INTELLIGENCE SYSTEM (ASYNC + FAST + LOGGED)
-# -----------------------------------------------------------
-# UPGRADE:
-# ========
-# - FULL async I/O (aiohttp)
-# - concurrent job fetching
-# - Playwright used only as fallback
-# - structured logging (real-time visibility)
-# - faster RSS + HTML pipeline
-# - caching + early filtering
-#
-# RESULT:
-# =======
-# 5–10x faster execution + visible pipeline tracing
+# ELITE RUBY JOB INTELLIGENCE SYSTEM (ASYNC + LOGGING + COMPANY MEMORY)
+# --------------------------------------------------------------------
 
 import asyncio
 import aiohttp
@@ -33,10 +21,10 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ---------------- CONFIG ----------------
-MIN_CAD = 150000
-USD_TO_CAD = 1.35
+def log(step, msg):
+    logger.info(f"[{step}] {msg}")
 
+# ---------------- CONFIG ----------------
 RUBY_KEYWORDS = ["ruby", "rails"]
 EXCLUDE_KEYWORDS = ["staff", "principal", "director", "head"]
 
@@ -62,25 +50,59 @@ EMAIL_RECEIVER = os.getenv("EMAIL_RECEIVER")
 
 CACHE = set()
 
-# ---------------- UTIL ----------------
+# ---------------- COMPANY STORAGE ----------------
+
+def load_companies():
+    try:
+        with open(COMPANY_STORE_FILE, "r") as f:
+            return json.load(f)
+    except:
+        return {"greenhouse": [], "lever": [], "ashby": []}
+
+
+def save_companies(data):
+    with open(COMPANY_STORE_FILE, "w") as f:
+        json.dump(data, f, indent=2)
+
+def detect_platform(url):
+    if "greenhouse" in url:
+        return "greenhouse"
+    if "lever" in url:
+        return "lever"
+    if "ashby" in url:
+        return "ashby"
+    return None
+
+
+def discover_company(url, store):
+    platform = detect_platform(url)
+    if not platform:
+        return
+
+    parts = url.split("/")
+    if len(parts) < 2:
+        return
+
+    company = parts[-1].strip()
+    if not company:
+        return
+
+    if company not in store[platform]:
+        store[platform].append(company)
+        log("DISCOVERY", f"New company: {company} ({platform})")
+
+# ---------------- HELPERS ----------------
 
 def contains_ruby(text):
     t = text.lower()
     return any(k in t for k in RUBY_KEYWORDS)
 
-
 def is_excluded(text):
     t = text.lower()
     return any(k in t for k in EXCLUDE_KEYWORDS)
 
-
 def is_remote(text):
     return "remote" in text.lower()
-
-# ---------------- LOG HELPERS ----------------
-
-def log(step, msg):
-    logger.info(f"[{step}] {msg}")
 
 # ---------------- ASYNC HTTP ----------------
 
@@ -103,7 +125,7 @@ def fetch_rss_jobs():
             data = feedparser.parse(feed)
 
             for entry in data.entries:
-                text = entry.get("title","") + entry.get("summary","")
+                text = entry.get("title", "") + entry.get("summary", "")
 
                 if contains_ruby(text) and is_remote(text) and not is_excluded(text):
                     jobs.append({
@@ -133,35 +155,6 @@ async def fetch_js(url):
         log("PLAYWRIGHT", f"Failed {url}: {e}")
         return None
 
-# ---------------- JOB PROCESSING ----------------
-
-async def process_job(session, url):
-    if url in CACHE:
-        return None
-
-    CACHE.add(url)
-
-    log("JOB", f"Fetching {url}")
-
-    html = await fetch(session, url)
-    if not html:
-        return None
-
-    if not contains_ruby(html):
-        return None
-
-    if is_excluded(html):
-        return None
-
-    if not is_remote(html):
-        return None
-
-    return {
-        "title": "Ruby Job",
-        "link": url,
-        "company": "discovered"
-    }
-
 # ---------------- SEARCH SCRAPER ----------------
 
 async def fetch_search_jobs():
@@ -170,7 +163,6 @@ async def fetch_search_jobs():
     async with aiohttp.ClientSession() as session:
 
         tasks = []
-
         for url in SEARCH_PAGES:
             log("SEARCH", f"Scanning {url}")
             tasks.append(fetch(session, url))
@@ -209,6 +201,35 @@ async def fetch_search_jobs():
 
     return jobs
 
+# ---------------- JOB PROCESSING ----------------
+
+async def process_job(session, url):
+    if url in CACHE:
+        return None
+
+    CACHE.add(url)
+
+    log("JOB", f"Fetching {url}")
+
+    html = await fetch(session, url)
+    if not html:
+        return None
+
+    if not contains_ruby(html):
+        return None
+
+    if is_excluded(html):
+        return None
+
+    if not is_remote(html):
+        return None
+
+    return {
+        "title": "Ruby Job",
+        "link": url,
+        "company": "discovered"
+    }
+
 # ---------------- MAIN ----------------
 
 async def main():
@@ -216,13 +237,34 @@ async def main():
 
     jobs = []
 
-    # RSS (fast path)
+    # LOAD COMPANY GRAPH
+    store = load_companies()
+
+    # RSS
     jobs += fetch_rss_jobs()
 
-    # Async search scraping
+    # SEARCH
     jobs += await fetch_search_jobs()
 
-    # Dedup
+    # ---------------- COMPANY DISCOVERY ----------------
+    log("DISCOVERY", "Extracting companies")
+
+    async with aiohttp.ClientSession() as session:
+        tasks = [fetch(session, j["link"]) for j in jobs]
+        pages = await asyncio.gather(*tasks)
+
+        for html in pages:
+            if not html:
+                continue
+
+            soup = BeautifulSoup(html, "html.parser")
+
+            for a in soup.find_all("a", href=True):
+                discover_company(a["href"], store)
+
+    save_companies(store)
+
+    # ---------------- DEDUPE ----------------
     seen = set()
     final = []
 
@@ -258,8 +300,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-
-# ---------------- INSTALL ----------------
-# pip install aiohttp beautifulsoup4 feedparser playwright
-# playwright install
-# run via GitHub Actions (FREE)
