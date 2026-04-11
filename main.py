@@ -1,18 +1,14 @@
-# ELITE RUBY JOB INTELLIGENCE SYSTEM (HIMALAYAS + RUBYONREMOTE PLAYWRIGHT)
-# -----------------------------------------------------------------------
-
 import asyncio
 import aiohttp
 import json
-import smtplib
-import logging
 import os
 import re
-from urllib.parse import urljoin
+import smtplib
+import logging
+from urllib.parse import urljoin, urlparse
 from email.mime.text import MIMEText
 from datetime import datetime
 from bs4 import BeautifulSoup
-from playwright.async_api import async_playwright
 
 # ---------------- LOGGING ----------------
 logging.basicConfig(
@@ -28,43 +24,34 @@ EMAIL_SENDER = os.getenv("EMAIL_SENDER")
 EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD")
 EMAIL_RECEIVER = os.getenv("EMAIL_RECEIVER")
 
-COMPANY_STORE_FILE = "companies.json"
+COMPANY_FILE = "companies.json"
 
 RUBY_KEYWORDS = ["ruby", "rails"]
 
-ENGINEER_KEYWORDS = [
-    "engineer", "developer", "backend", "full stack",
-    "software engineer", "software developer"
+INCLUDE_ROLES = [
+    "engineer", "developer", "backend",
+    "full stack", "software engineer", "software developer"
 ]
 
-EXCLUDE_KEYWORDS = [
-    "staff", "principal", "lead", "manager",
-    "director", "vp", "head", "architect"
+EXCLUDE_ROLES = [
+    "staff", "principal", "director", "vp", "head", "architect", "manager"
 ]
 
-# ---------------- HELPERS ----------------
+# ---------------- UTIL ----------------
 
-def contains_ruby(text):
-    return any(k in text.lower() for k in RUBY_KEYWORDS)
+def load_companies():
+    try:
+        with open(COMPANY_FILE, "r") as f:
+            data = json.load(f)
+            log("STATE", f"Loaded companies")
+            return data
+    except:
+        return {"greenhouse": [], "lever": [], "ashby": [], "workable": []}
 
-def is_valid_engineer_role(title):
-    t = title.lower()
-
-    if any(bad in t for bad in EXCLUDE_KEYWORDS):
-        return False
-
-    return any(good in t for good in ENGINEER_KEYWORDS)
-
-def is_canada_friendly(text):
-    t = text.lower()
-
-    if "canada" in t:
-        return True
-
-    if "remote" in t and not any(x in t for x in ["india", "philippines", "latam"]):
-        return True
-
-    return False
+def save_companies(data):
+    with open(COMPANY_FILE, "w") as f:
+        json.dump(data, f, indent=2)
+    log("STATE", "Saved companies.json")
 
 def extract_salary(text):
     if not text:
@@ -83,156 +70,244 @@ def extract_salary(text):
 
     return None
 
-# ---------------- COMPANY STORAGE ----------------
+def is_valid_role(title):
+    t = title.lower()
 
-def load_companies():
-    try:
-        with open(COMPANY_STORE_FILE, "r") as f:
-            return json.load(f)
-    except:
-        return {"greenhouse": [], "lever": [], "ashby": [], "workable": []}
+    if any(x in t for x in EXCLUDE_ROLES):
+        return False
 
-def save_companies(data):
-    with open(COMPANY_STORE_FILE, "w") as f:
-        json.dump(data, f, indent=2)
+    if any(x in t for x in INCLUDE_ROLES):
+        return True
 
-# ---------------- FETCH ----------------
+    return False
 
+def is_ruby(text):
+    return any(k in text.lower() for k in RUBY_KEYWORDS)
+
+def is_canada_remote(text):
+    t = text.lower()
+    return "canada" in t or "remote" in t
+
+# ---------------- HTTP ----------------
 async def fetch(session, url):
     try:
-        async with session.get(url, timeout=20) as r:
+        async with session.get(url, timeout=25) as r:
             return await r.text()
     except Exception as e:
         log("HTTP", f"{url} -> {e}")
         return None
 
-# ---------------- HIMALAYAS ----------------
+# ---------------- GREENHOUSE ----------------
+async def fetch_greenhouse(session, company):
+    url = f"https://boards-api.greenhouse.io/v1/boards/{company}/jobs"
+    log("GREENHOUSE", company)
 
+    html = await fetch(session, url)
+    if not html:
+        return []
+
+    try:
+        data = json.loads(html)
+    except:
+        log("GREENHOUSE", f"invalid JSON: {company}")
+        return []
+
+    jobs = []
+    for j in data.get("jobs", []):
+        title = j.get("title", "")
+        link = j.get("absolute_url", "")
+
+        if is_ruby(title) and is_valid_role(title):
+            jobs.append({
+                "title": title,
+                "link": link,
+                "company": company,
+                "salary": "N/A"
+            })
+
+    log("GREENHOUSE", f"{company} -> {len(jobs)}")
+    return jobs
+
+# ---------------- LEVER ----------------
+async def fetch_lever(session, company):
+    url = f"https://api.lever.co/v0/postings/{company}"
+    log("LEVER", company)
+
+    html = await fetch(session, url)
+    if not html:
+        return []
+
+    try:
+        data = json.loads(html)
+    except:
+        return []
+
+    jobs = []
+    for j in data:
+        title = j.get("text", "")
+        link = j.get("hostedUrl", "")
+
+        if is_ruby(title) and is_valid_role(title):
+            jobs.append({
+                "title": title,
+                "link": link,
+                "company": company,
+                "salary": j.get("salary", "N/A")
+            })
+
+    log("LEVER", f"{company} -> {len(jobs)}")
+    return jobs
+
+# ---------------- ASHBY ----------------
+async def fetch_ashby(session, company):
+    url = f"https://jobs.ashbyhq.com/api/job-board/{company}"
+    log("ASHBY", company)
+
+    html = await fetch(session, url)
+    if not html:
+        return []
+
+    try:
+        data = json.loads(html)
+    except:
+        return []
+
+    jobs = []
+    for j in data.get("jobs", []):
+        title = j.get("title", "")
+        link = j.get("jobUrl", "")
+
+        if is_ruby(title) and is_valid_role(title):
+            jobs.append({
+                "title": title,
+                "link": link,
+                "company": company,
+                "salary": "N/A"
+            })
+
+    log("ASHBY", f"{company} -> {len(jobs)}")
+    return jobs
+
+# ---------------- WORKABLE ----------------
+async def fetch_workable(session, company):
+    url = f"https://{company}.workable.com/spi/v3/jobs"
+    log("WORKABLE", company)
+
+    html = await fetch(session, url)
+    if not html:
+        return []
+
+    try:
+        data = json.loads(html)
+    except:
+        return []
+
+    jobs = []
+    for j in data.get("jobs", []):
+        title = j.get("title", "")
+        link = j.get("url", "")
+
+        if is_ruby(title) and is_valid_role(title):
+            jobs.append({
+                "title": title,
+                "link": link,
+                "company": company,
+                "salary": "N/A"
+            })
+
+    log("WORKABLE", f"{company} -> {len(jobs)}")
+    return jobs
+
+# ---------------- HIMALAYAS ----------------
 async def fetch_himalayas(session):
-    log("HIMALAYAS", "Fetching")
+    log("HIMALAYAS", "fetching Canada Ruby search")
 
     url = "https://himalayas.app/jobs/countries/canada?q=ruby"
     html = await fetch(session, url)
 
-    if not html:
-        return []
-
     soup = BeautifulSoup(html, "html.parser")
 
-    links = []
+    links = set()
     for a in soup.find_all("a", href=True):
         if "/jobs/" in a["href"]:
-            links.append(urljoin(url, a["href"]))
+            links.add(urljoin(url, a["href"]))
 
-    links = list(set(links))
-    log("HIMALAYAS", f"Found {len(links)} links")
-
-    tasks = [process_job(session, u) for u in links[:30]]
-    results = await asyncio.gather(*tasks)
-
-    jobs = [r for r in results if r]
-    log("HIMALAYAS", f"Valid jobs: {len(jobs)}")
-
-    return jobs
-
-# ---------------- RUBYONREMOTE (PLAYWRIGHT) ----------------
-
-async def fetch_rubyonremote():
-    log("RUBYONREMOTE", "Launching browser")
+    log("HIMALAYAS", f"links found: {len(links)}")
 
     jobs = []
 
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
-        page = await browser.new_page()
+    for link in list(links)[:30]:
+        page = await fetch(session, link)
+        if not page:
+            continue
 
-        url = "https://rubyonremote.com/remote-jobs-in-canada/"
-        await page.goto(url, timeout=60000)
+        soup = BeautifulSoup(page, "html.parser")
+        title = soup.find("h1")
+        title = title.text.strip() if title else "Unknown"
 
-        await page.wait_for_timeout(5000)  # wait for Cloudflare + JS
+        body = soup.get_text(" ", strip=True)
+        salary = extract_salary(body)
 
-        html = await page.content()
-        await browser.close()
+        if not is_ruby(body):
+            continue
+        if not is_valid_role(title):
+            continue
 
-    soup = BeautifulSoup(html, "html.parser")
+        jobs.append({
+            "title": title,
+            "link": link,
+            "company": "himalayas",
+            "salary": salary or "N/A"
+        })
 
-    links = []
-
-    for a in soup.find_all("a", href=True):
-        href = a["href"]
-
-        if "/jobs/" in href:
-            full = urljoin(url, href)
-            links.append(full)
-
-    links = list(set(links))
-    log("RUBYONREMOTE", f"Found {len(links)} links")
-
-    async with aiohttp.ClientSession() as session:
-        tasks = [process_job(session, u) for u in links[:30]]
-        results = await asyncio.gather(*tasks)
-
-    jobs = [r for r in results if r]
-    log("RUBYONREMOTE", f"Valid jobs: {len(jobs)}")
-
+    log("HIMALAYAS", f"valid jobs: {len(jobs)}")
     return jobs
 
-# ---------------- JOB PROCESSING ----------------
-
-async def process_job(session, url):
-    html = await fetch(session, url)
-    if not html:
-        log("REJECT", f"[NO_HTML] {url}")
-        return None
-
-    soup = BeautifulSoup(html, "html.parser")
-
-    title_tag = soup.find("h1")
-    title = title_tag.get_text(strip=True) if title_tag else "Unknown"
-
-    body = soup.get_text(" ", strip=True)
-
-    salary = extract_salary(body)
-
-    log("CHECK", f"{title} | {url}")
-
-    if not contains_ruby(body):
-        log("REJECT", f"[NOT_RUBY] {url}")
-        return None
-
-    if not is_valid_engineer_role(title):
-        log("REJECT", f"[NOT_ENGINEER] {title} | {url}")
-        return None
-
-    if not is_canada_friendly(body):
-        log("REJECT", f"[NOT_CANADA] {url}")
-        return None
-
-    log("ACCEPT", f"{title} | salary={salary}")
-
-    return {
-        "title": title,
-        "link": url,
-        "salary": salary or "N/A",
-        "company": url.split("/")[4] if "companies" in url else "unknown"
-    }
-
 # ---------------- MAIN ----------------
-
 async def main():
     log("SYSTEM", "Starting Job Engine")
 
-    jobs = []
+    store = load_companies()
 
     async with aiohttp.ClientSession() as session:
+
+        jobs = []
+
+        # Himalayas
         jobs += await fetch_himalayas(session)
 
-    # RubyOnRemote uses Playwright separately
-    jobs += await fetch_rubyonremote()
+        # Greenhouse / Lever / Ashby / Workable (sample companies list)
+        greenhouse_companies = ["gitlab", "coinbase", "shopify"]
+        lever_companies = ["lever", "zoom", "figma"]
+        ashby_companies = ["ashby", "stripe"]
+        workable_companies = ["automattic"]
 
-    # GROUP
-    grouped = {}
+        for c in greenhouse_companies:
+            jobs += await fetch_greenhouse(session, c)
+
+        for c in lever_companies:
+            jobs += await fetch_lever(session, c)
+
+        for c in ashby_companies:
+            jobs += await fetch_ashby(session, c)
+
+        for c in workable_companies:
+            jobs += await fetch_workable(session, c)
+
+    # dedupe
+    seen = set()
+    final = []
     for j in jobs:
+        if j["link"] in seen:
+            continue
+        seen.add(j["link"])
+        final.append(j)
+
+    log("SYSTEM", f"total jobs: {len(final)}")
+
+    # group email
+    grouped = {}
+    for j in final:
         grouped.setdefault(j["company"], []).append(j)
 
     body = f"🔥 RUBY JOBS - {datetime.now().strftime('%Y-%m-%d')}\n\n"
@@ -243,7 +318,7 @@ async def main():
             body += f"{j['title']}\n{j['salary']}\n{j['link']}\n\n"
 
     msg = MIMEText(body)
-    msg["Subject"] = "🔥 Ruby Jobs"
+    msg["Subject"] = "Ruby Jobs"
     msg["From"] = EMAIL_SENDER
     msg["To"] = EMAIL_RECEIVER
 
@@ -251,13 +326,13 @@ async def main():
         with smtplib.SMTP_SSL("smtp.gmail.com", 465) as s:
             s.login(EMAIL_SENDER, EMAIL_PASSWORD)
             s.send_message(msg)
-        log("EMAIL", f"Sent {len(jobs)} jobs")
+        log("EMAIL", f"sent {len(final)} jobs")
     except Exception as e:
         log("EMAIL", str(e))
 
-    log("SYSTEM", "Complete")
+    save_companies(store)
+    log("SYSTEM", "DONE")
 
 # ---------------- RUN ----------------
-
 if __name__ == "__main__":
     asyncio.run(main())
